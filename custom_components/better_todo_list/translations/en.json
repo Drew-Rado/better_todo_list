@@ -1,0 +1,35 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Create a new todo list",
+        "description": "Better Todo List treats each list as its own integration entry. Give this list a name (e.g. \"Kitchen Chores\", \"Weekly Errands\", \"Downstairs Bathroom\") - add this integration again whenever you want another list.",
+        "data": {
+          "list_name": "List name"
+        }
+      }
+    },
+    "error": {
+      "name_required": "Please enter a name for this list.",
+      "name_too_long": "That name is too long (200 characters max).",
+      "name_exists": "A list with this name already exists. Choose a different name."
+    },
+    "abort": {
+      "already_configured": "This list is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Rename this list",
+        "data": {
+          "list_name": "List name"
+        }
+      }
+    },
+    "error": {
+      "name_required": "Please enter a name for this list.",
+      "name_too_long": "That name is too long (200 characters max)."
+    }
+  }
+}

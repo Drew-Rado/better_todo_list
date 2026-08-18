@@ -1,0 +1,106 @@
+# Describes better_todo_list.* services for Home Assistant's UI service-call
+# builder (Developer Tools -> Actions). Keep the fields here in sync with the
+# voluptuous schemas in __init__.py (_ADD_TASK_SCHEMA / _TASK_ID_SCHEMA) -
+# this file only affects the UI, it doesn't validate anything itself.
+
+add_task:
+  name: Add task
+  description: >-
+    Create a new task on a Better Todo List list. Useful for creating tasks
+    from automations (e.g. a recurring cleaning reminder triggered by an
+    NFC tag, or a task created when a package is delivered).
+  fields:
+    entity_id:
+      name: List
+      description: The todo.* entity for the list to add the task to.
+      required: true
+      selector:
+        entity:
+          domain: todo
+          integration: better_todo_list
+    title:
+      name: Title
+      description: The task's title.
+      required: true
+      example: "Take out the trash"
+      selector:
+        text:
+    notes:
+      name: Notes
+      description: Optional free-text notes/description.
+      selector:
+        text:
+          multiline: true
+    due_date:
+      name: Due date
+      description: Due date.
+      selector:
+        date:
+    due_time:
+      name: Due time
+      description: Due time.
+      selector:
+        time:
+    priority:
+      name: Priority
+      description: Task priority.
+      selector:
+        select:
+          options:
+            - "low"
+            - "medium"
+            - "high"
+    tags:
+      name: Tags
+      description: A list of tags to attach to the task, e.g. ["chores", "weekly"].
+      selector:
+        object:
+    area_id:
+      name: Room
+      description: The Home Assistant Area to use as this task's Room.
+      selector:
+        area:
+
+complete_task:
+  name: Complete task
+  description: >-
+    Mark a task complete. If the task recurs, this automatically reschedules
+    it to its next occurrence instead of leaving it marked done.
+  fields:
+    entity_id:
+      name: List
+      description: The todo.* entity for the list the task belongs to.
+      required: true
+      selector:
+        entity:
+          domain: todo
+          integration: better_todo_list
+    task_id:
+      name: Task ID
+      description: >-
+        The task's internal ID. Find it in the custom card (task details)
+        or in a Download Diagnostics export.
+      required: true
+      selector:
+        text:
+
+reopen_task:
+  name: Reopen task
+  description: Mark a previously-completed task as not done again.
+  fields:
+    entity_id:
+      name: List
+      description: The todo.* entity for the list the task belongs to.
+      required: true
+      selector:
+        entity:
+          domain: todo
+          integration: better_todo_list
+    task_id:
+      name: Task ID
+      description: >-
+        The task's internal ID. Find it in the custom card (task details)
+        or in a Download Diagnostics export.
+      required: true
+      selector:
+        text:
