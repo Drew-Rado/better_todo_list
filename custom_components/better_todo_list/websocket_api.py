@@ -28,6 +28,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN
 from .store import BetterTodoListStore
@@ -79,10 +80,26 @@ def _send_store_error(connection: websocket_api.ActiveConnection, msg_id: int, e
 @websocket_api.websocket_command({vol.Required("type"): "better_todo_list/get_lists"})
 @websocket_api.async_response
 async def handle_get_lists(hass, connection, msg):
-    """All configured lists, so the card knows what's available."""
+    """All configured lists, so the card knows what's available.
+
+    Includes each list's native todo.* entity_id (looked up by unique_id,
+    since the entity_id itself is name-derived and can change) so the card
+    can detect when one of them changes - see _maybeSyncOnHassChange in
+    better-todo-list-card.js, which compares this entity's state object
+    across the `hass` updates Home Assistant's frontend already delivers
+    to every card. todo.py calls async_write_ha_state() after every store
+    mutation, from any client, which is what makes that state object
+    change - so this piggybacks on Home Assistant's existing real-time
+    entity updates instead of building a separate push mechanism.
+    """
     stores: dict[str, BetterTodoListStore] = hass.data.get(DOMAIN, {}).get("stores", {})
+    registry = er.async_get(hass)
     lists = [
-        {"entry_id": entry.entry_id, "name": entry.title}
+        {
+            "entry_id": entry.entry_id,
+            "name": entry.title,
+            "entity_id": registry.async_get_entity_id("todo", DOMAIN, entry.entry_id),
+        }
         for entry in hass.config_entries.async_entries(DOMAIN)
         if entry.entry_id in stores
     ]

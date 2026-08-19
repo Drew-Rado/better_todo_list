@@ -27,6 +27,9 @@ sync (CalDAV/Google Tasks/Todoist/Bring), or voice dictation.
 - Also shows up as a native `todo.*` entity per list, so it works with
   Home Assistant's built-in Todo card, Assist voice control, and the
   Companion App - on top of the richer custom card
+- Live multi-client sync: if two household members have the same dashboard
+  open at once, a change made on one shows up on the other automatically,
+  no manual refresh needed
 
 ## Repository layout
 
@@ -120,9 +123,6 @@ from an automation.
   (CalDAV/Google Tasks/Todoist/Bring) - the whole point of this project.
 - No manual drag-and-drop reordering in the card (tasks sort automatically
   by priority/due date instead).
-- No live multi-client sync: if you have the same dashboard open on two
-  devices, changes made on one won't appear on the other until you refresh
-  the card (the refresh button in the toolbar) or reload the page.
 - Home Assistant's native `todo.*` entity schema has no room for priority,
   tags, room, subtasks, or recurrence - those fields only show up in the
   custom card, not in HA's built-in Todo card or Assist voice responses.

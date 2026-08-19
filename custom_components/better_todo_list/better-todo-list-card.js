@@ -234,6 +234,8 @@ class BetterTodoListCard extends HTMLElement {
     this._loaded = false;
     this._dialogState = null;
     this._searchDebounceTimer = null;
+    this._watchedEntityIds = new Set();
+    this._syncDebounceTimer = null;
 
     this.shadowRoot.innerHTML = `
       <style>${CARD_CSS}</style>
@@ -271,11 +273,40 @@ class BetterTodoListCard extends HTMLElement {
   }
 
   set hass(hass) {
+    const oldHass = this._hass;
     this._hass = hass;
     if (!this._loaded && this.isConnected) {
       this._loaded = true;
       this._loadAll();
+      return;
     }
+    this._maybeSyncOnHassChange(oldHass, hass);
+  }
+
+  // Live multi-client sync: Home Assistant's frontend re-invokes this
+  // setter on EVERY entity state change system-wide (not just ours), so we
+  // don't need a separate WebSocket subscription - we just need to notice
+  // when it's one of our lists' todo.* entities that changed. HA's state
+  // objects are immutable (a changed entity gets a new object; unchanged
+  // ones keep the same reference), so a `!==` check is a cheap, reliable
+  // way to detect "did this entity actually change" without deep-comparing
+  // anything. todo.py writes a new state on every store mutation from any
+  // client (see its `_handle_store_changed`), which is what makes this work.
+  _maybeSyncOnHassChange(oldHass, hass) {
+    if (!oldHass || !this._watchedEntityIds.size) return;
+    for (const entityId of this._watchedEntityIds) {
+      if (oldHass.states[entityId] !== hass.states[entityId]) {
+        this._scheduleSyncRefresh();
+        return;
+      }
+    }
+  }
+
+  _scheduleSyncRefresh() {
+    clearTimeout(this._syncDebounceTimer);
+    this._syncDebounceTimer = setTimeout(() => {
+      this._refreshTasks().catch((err) => this._showError(err));
+    }, 300);
   }
 
   get hass() {
@@ -313,6 +344,11 @@ class BetterTodoListCard extends HTMLElement {
       this._lists = lists;
       this._areas = areas;
       this._entryIds = this._resolveEntryIds(lists);
+      this._watchedEntityIds = new Set(
+        lists
+          .filter((l) => this._entryIds.includes(l.entry_id) && l.entity_id)
+          .map((l) => l.entity_id)
+      );
       await this._refreshTasks();
     } catch (err) {
       this._showError(err);
