@@ -135,6 +135,11 @@ from an automation.
 - Home Assistant's native `todo.*` entity schema has no room for priority,
   tags, room, subtasks, or recurrence - those fields only show up in the
   custom card, not in HA's built-in Todo card or Assist voice responses.
+- If you fully remove this integration, it leaves behind one entry in
+  Settings -> Dashboards -> Resources (pointing at the card's JS file).
+  It's harmless if left in place - the worst case is a broken URL that
+  nothing references - but you can delete it by hand from that same page
+  if you want it gone.
 
 ## Debugging
 

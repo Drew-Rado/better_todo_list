@@ -166,7 +166,67 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     integration = await async_get_integration(hass, DOMAIN)
     versioned_url = f"{FRONTEND_SCRIPT_URL}?v={integration.version}"
     add_extra_js_url(hass, versioned_url)
+    await _async_register_lovelace_resource(hass, versioned_url)
     _LOGGER.debug("Registered frontend card at %s -> %s", versioned_url, js_path)
+
+
+async def _async_register_lovelace_resource(hass: HomeAssistant, versioned_url: str) -> None:
+    """Best-effort: ALSO register as a proper Lovelace "resource" (the kind
+    listed under Settings -> Dashboards -> Resources), on top of the
+    add_extra_js_url call above.
+
+    WHY: add_extra_js_url works everywhere (including YAML-mode dashboards)
+    but doesn't make Lovelace *wait* for the script before it starts
+    rendering cards - which can lose a race against Home Assistant's
+    hardcoded ~2 second "give up waiting for a custom element to register"
+    timeout, especially with the 2026.6+ "Add Card" dialog's live preview
+    thumbnails (which try to render every matching card, including ours,
+    the moment you search). A properly registered resource IS awaited by
+    Lovelace's own dashboard bootstrap, closing that race by construction
+    instead of just hoping the network fetch finishes in time.
+
+    This only works for storage-mode dashboards (the default) - YAML-mode
+    dashboards manage their own resources list and can't be written to at
+    runtime, so we just skip for those; add_extra_js_url above is already
+    sufficient there (the card still loads, it just can't win that
+    specific race in the picker's live preview). Any failure here is
+    caught and logged, never raised - this is purely additive, and
+    add_extra_js_url is what this integration has always relied on, so
+    nothing breaks if this fails for an unforeseen reason.
+
+    SAFETY NOTE: writing to this collection before it has loaded its
+    existing data from disk used to be able to silently wipe out every
+    OTHER resource you had registered (Home Assistant core issue #165767) -
+    fixed in core PR #165773. manifest.json requires Home Assistant
+    2026.6.0+ specifically so that fix is guaranteed present; we also
+    explicitly call async_get_info() first below (which forces the load)
+    as defense in depth, on top of the fix itself.
+
+    This writes into the same storage Settings -> Dashboards -> Resources
+    reads and edits - if you ever want to inspect or remove this entry by
+    hand, that's where to look for it.
+    """
+    lovelace_data = hass.data.get("lovelace")
+    if lovelace_data is None or getattr(lovelace_data, "resource_mode", None) != "storage":
+        _LOGGER.debug("Skipping Lovelace resource registration (not in storage mode)")
+        return
+
+    resources = lovelace_data.resources
+    try:
+        await resources.async_get_info()  # forces existing resources to load first - see SAFETY NOTE above
+
+        existing = [item for item in resources.async_items() if item["url"].startswith(FRONTEND_SCRIPT_URL)]
+        for item in existing:
+            if item["url"] == versioned_url:
+                return  # already correctly registered, nothing to do
+            await resources.async_delete_item(item["id"])
+
+        await resources.async_create_item({"res_type": "module", "url": versioned_url})
+        _LOGGER.debug("Registered %s as a Lovelace resource", versioned_url)
+    except Exception as err:  # noqa: BLE001 - best-effort only, must never break setup
+        _LOGGER.debug(
+            "Could not register as a Lovelace resource (non-fatal, add_extra_js_url still covers it): %s", err
+        )
 
 
 def _resolve_store(hass: HomeAssistant, entity_id: str) -> BetterTodoListStore:
