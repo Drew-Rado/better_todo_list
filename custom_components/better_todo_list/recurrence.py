@@ -51,15 +51,33 @@ import calendar
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Optional
 
-from .const import (
-    RECURRENCE_END_COUNT,
-    RECURRENCE_END_DATE,
-    RECURRENCE_INTERVAL,
-    RECURRENCE_MONTHLY_DAY,
-    RECURRENCE_MONTHLY_WEEKDAY,
-    RECURRENCE_WEEKLY,
-    RECURRENCE_YEARLY,
-)
+try:
+    # Normal case: imported as part of the custom_components.better_todo_list
+    # package (i.e. by Home Assistant, or `python -m custom_components...`).
+    from .const import (
+        RECURRENCE_END_COUNT,
+        RECURRENCE_END_DATE,
+        RECURRENCE_INTERVAL,
+        RECURRENCE_MONTHLY_DAY,
+        RECURRENCE_MONTHLY_WEEKDAY,
+        RECURRENCE_WEEKLY,
+        RECURRENCE_YEARLY,
+    )
+except ImportError:
+    # Running this file directly (`python recurrence.py`) - there's no
+    # parent package for a relative import to resolve against. const.py has
+    # no Home Assistant dependencies, so we can just import it as a
+    # standalone module instead; Python already put this file's directory
+    # on sys.path for us.
+    from const import (  # type: ignore[no-redef]
+        RECURRENCE_END_COUNT,
+        RECURRENCE_END_DATE,
+        RECURRENCE_INTERVAL,
+        RECURRENCE_MONTHLY_DAY,
+        RECURRENCE_MONTHLY_WEEKDAY,
+        RECURRENCE_WEEKLY,
+        RECURRENCE_YEARLY,
+    )
 
 # Hard safety cap on how many days we'll step forward while searching for
 # the next occurrence. A well-formed recurrence resolves in well under 400

@@ -7,10 +7,6 @@ core idea (rich tasks with priority, tags, subtasks, recurrence, and a
 custom Lovelace card), but without AI image generation, external provider
 sync (CalDAV/Google Tasks/Todoist/Bring), or voice dictation.
 
-> **Before you publish this to GitHub:** search the repo for
-> `YOUR_GITHUB_USERNAME` (in `custom_components/better_todo_list/manifest.json`)
-> and replace it with your actual GitHub username/repo path.
-
 ## Features
 
 - Any number of lists (each list = one Home Assistant integration entry)
