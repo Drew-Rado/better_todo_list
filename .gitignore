@@ -5,6 +5,7 @@ __pycache__/
 # Local Claude Code settings/session data - can contain machine-specific
 # paths and permission grants that don't belong in a public repo.
 .claude/
+.obsidian/
 
 # Anything that looks like a secret/credentials file, in case a local test
 # config ever ends up in this folder.
