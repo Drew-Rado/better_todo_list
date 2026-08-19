@@ -44,6 +44,7 @@ from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
 from . import websocket_api
 from .const import (
@@ -141,15 +142,31 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     This is what lets you add `type: custom:better-todo-list-card` to a
     dashboard without ever visiting Settings -> Dashboards -> Resources -
     the integration registers the resource for you.
+
+    WHY cache_headers=True + a "?v=<version>" suffix: this used to be
+    cache_headers=False (no caching at all), which sounded safer but
+    actually caused the "Custom element not found: better-todo-list-card"
+    error intermittently - with caching disabled, *every* dashboard load
+    (not just the first one ever) has to make a fresh network request for
+    this file before the card can register itself, and if Lovelace tries
+    to render the card before that request finishes (more likely on a
+    slower/mobile connection), it gives up with that error instead of
+    waiting. Letting the browser cache the file normally means only the
+    very first load after each update pays that cost. Tagging the URL with
+    the integration's version means an update still forces a fresh fetch
+    automatically - no more manual hard-refreshing needed after upgrading.
     """
     frontend_dir = Path(__file__).parent
     js_path = str(frontend_dir / f"{CARD_TAG}.js")
 
     await hass.http.async_register_static_paths(
-        [StaticPathConfig(FRONTEND_SCRIPT_URL, js_path, cache_headers=False)]
+        [StaticPathConfig(FRONTEND_SCRIPT_URL, js_path, cache_headers=True)]
     )
-    add_extra_js_url(hass, FRONTEND_SCRIPT_URL)
-    _LOGGER.debug("Registered frontend card at %s -> %s", FRONTEND_SCRIPT_URL, js_path)
+
+    integration = await async_get_integration(hass, DOMAIN)
+    versioned_url = f"{FRONTEND_SCRIPT_URL}?v={integration.version}"
+    add_extra_js_url(hass, versioned_url)
+    _LOGGER.debug("Registered frontend card at %s -> %s", versioned_url, js_path)
 
 
 def _resolve_store(hass: HomeAssistant, entity_id: str) -> BetterTodoListStore:
