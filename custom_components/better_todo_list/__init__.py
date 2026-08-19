@@ -69,6 +69,12 @@ from .store import BetterTodoListStore
 
 _LOGGER = logging.getLogger(__name__)
 
+# This integration is only ever set up via the UI (Settings -> Devices &
+# Services -> Add Integration), never via configuration.yaml - one config
+# entry per list, created by config_flow.py. This tells Home Assistant
+# (and silences a hassfest warning) that there's no YAML schema to define.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 # hass.data[DOMAIN] layout:
 # {
 #     "stores": {entry_id: BetterTodoListStore, ...},
