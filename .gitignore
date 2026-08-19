@@ -1,3 +1,15 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local Claude Code settings/session data - can contain machine-specific
+# paths and permission grants that don't belong in a public repo.
+.claude/
+
+# Anything that looks like a secret/credentials file, in case a local test
+# config ever ends up in this folder.
+.env
+.env.*
+secrets.yaml
+*.pem
+*.key
