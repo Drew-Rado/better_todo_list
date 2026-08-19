@@ -1175,18 +1175,29 @@ class BetterTodoListCard extends HTMLElement {
   }
 }
 
-customElements.define("better-todo-list-card", BetterTodoListCard);
+// Guarded against double-registration: this file can legitimately end up
+// requested twice on the same page - once via Home Assistant's
+// add_extra_js_url (an unconditional <script type="module"> on every
+// page load) and again via this integration's Lovelace "resource" entry
+// (loaded independently by Lovelace's own dashboard bootstrap - see
+// _async_register_lovelace_resource in __init__.py for why both exist).
+// customElements.define() throws if called twice for the same tag name,
+// which would otherwise abort this whole script partway through on the
+// second load and could disrupt the "Add Card" picker's card catalog.
+if (!customElements.get("better-todo-list-card")) {
+  customElements.define("better-todo-list-card", BetterTodoListCard);
 
-// Registers the card with HA's Lovelace card picker UI so it shows up
-// with a name/description instead of just its raw tag name.
-window.customCards = window.customCards || [];
-window.customCards.push({
-  // NOTE: this "type" must carry the "custom:" prefix (unlike the tag name
-  // passed to customElements.define above) - without it, HA's card picker
-  // dialog silently won't list the card, even though `type:
-  // custom:better-todo-list-card` still works fine typed directly into a
-  // dashboard's YAML.
-  type: "custom:better-todo-list-card",
-  name: "Better Todo List",
-  description: "A room-aware todo list with priorities, tags, subtasks, and recurrence.",
-});
+  // Registers the card with HA's Lovelace card picker UI so it shows up
+  // with a name/description instead of just its raw tag name.
+  window.customCards = window.customCards || [];
+  window.customCards.push({
+    // NOTE: this "type" must carry the "custom:" prefix (unlike the tag
+    // name passed to customElements.define above) - without it, HA's card
+    // picker dialog silently won't list the card, even though `type:
+    // custom:better-todo-list-card` still works fine typed directly into a
+    // dashboard's YAML.
+    type: "custom:better-todo-list-card",
+    name: "Better Todo List",
+    description: "A room-aware todo list with priorities, tags, subtasks, and recurrence.",
+  });
+}
