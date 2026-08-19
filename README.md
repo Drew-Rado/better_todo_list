@@ -80,14 +80,17 @@ sense even without prior Home Assistant integration experience.
    "Card configuration"). The card's JS is registered automatically -
    there's no separate "Add Resource" step.
 
-   You can also try searching "Better Todo List" in the "By card" tab
-   instead of using Manual, but as of Home Assistant 2026.6 that search
-   tries to render a live preview thumbnail of every matching card, and
-   that preview mechanism can get stuck on a permanent loading spinner for
-   custom cards that load over the network (ours included) - this is a
-   rough edge in that (very new) HA core feature, not a sign anything is
-   actually broken. If you hit that, just use Manual instead; the card
-   works completely normally once it's actually on your dashboard either way.
+   Searching "Better Todo List" in the "By card" tab instead of using
+   Manual will very likely get stuck on a permanent loading spinner - as
+   of Home Assistant 2026.6, that search tab tries to render a live
+   preview thumbnail of every matching card, and that particular preview
+   mechanism doesn't reliably work for custom cards that load over the
+   network (confirmed via extensive testing: our card's script loads and
+   registers correctly, and it renders perfectly in the Manual/YAML
+   config editor's own preview - just not in that specific search grid).
+   This looks like a rough edge in that (two-month-old) HA core feature
+   itself, not anything wrong with the card, but there's no known fix
+   from the integration side - use Manual, it's the same card either way.
 
 ## Card configuration
 
