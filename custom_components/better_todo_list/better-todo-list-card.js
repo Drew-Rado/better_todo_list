@@ -1089,7 +1089,12 @@ customElements.define("better-todo-list-card", BetterTodoListCard);
 // with a name/description instead of just its raw tag name.
 window.customCards = window.customCards || [];
 window.customCards.push({
-  type: "better-todo-list-card",
+  // NOTE: this "type" must carry the "custom:" prefix (unlike the tag name
+  // passed to customElements.define above) - without it, HA's card picker
+  // dialog silently won't list the card, even though `type:
+  // custom:better-todo-list-card` still works fine typed directly into a
+  // dashboard's YAML.
+  type: "custom:better-todo-list-card",
   name: "Better Todo List",
   description: "A room-aware todo list with priorities, tags, subtasks, and recurrence.",
 });
