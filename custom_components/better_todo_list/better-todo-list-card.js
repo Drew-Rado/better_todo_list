@@ -485,7 +485,7 @@ class BetterTodoListCard extends HTMLElement {
   // on a checkbox bubbles up through its ancestors, so if these rows lived
   // inside .task-main a subtask click would also pop open the edit dialog.
   _inlineSubtasksHtml(entryId, task) {
-    const subs = task.subtasks || [];
+    const subs = task.sub_tasks || [];
     if (!subs.length) return "";
 
     const rows = subs
