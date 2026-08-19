@@ -160,9 +160,10 @@ const CARD_CSS = `
   .group-header { display: flex; align-items: center; gap: 8px; padding: 4px 16px; font-weight: 500; color: var(--secondary-text-color); text-transform: uppercase; font-size: 0.78em; letter-spacing: .04em; }
   .group-header .count { background: var(--divider-color); border-radius: 10px; padding: 0 6px; font-size: 0.9em; }
 
-  .task-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--divider-color); }
+  .task-row { padding: 8px 16px; border-bottom: 1px solid var(--divider-color); }
   .task-row:last-child { border-bottom: none; }
   .task-row.completed .task-title { text-decoration: line-through; color: var(--secondary-text-color); }
+  .task-row-main { display: flex; align-items: flex-start; gap: 10px; }
   .task-check { margin-top: 3px; width: 18px; height: 18px; flex: none; }
   .task-main { flex: 1; min-width: 0; cursor: pointer; }
   .task-title-row { display: flex; align-items: center; gap: 6px; }
@@ -172,6 +173,12 @@ const CARD_CSS = `
   .task-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; font-size: 0.82em; color: var(--secondary-text-color); align-items: center; }
   .task-meta .due.overdue { color: var(--error-color, #db4437); font-weight: 500; }
   .chip { background: var(--divider-color); border-radius: 10px; padding: 1px 8px; }
+  .task-notes { margin-top: 4px; font-size: 0.85em; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtasks-inline { display: flex; flex-direction: column; gap: 3px; margin: 6px 0 0 28px; padding-left: 8px; border-left: 2px solid var(--divider-color); }
+  .subtask-row-inline { display: flex; align-items: center; gap: 6px; font-size: 0.88em; }
+  .subtask-row-inline .subtask-check { width: 15px; height: 15px; flex: none; }
+  .subtask-row-inline span { flex: 1; word-break: break-word; color: var(--primary-text-color); }
+  .subtask-row-inline span.completed { text-decoration: line-through; color: var(--secondary-text-color); }
   .icon-btn { background: transparent; border: none; color: var(--secondary-text-color); cursor: pointer; font-size: 1em; padding: 4px; }
 
   dialog { border: none; border-radius: 12px; padding: 0; width: min(480px, 92vw); max-height: 88vh; background: var(--card-background-color, #fff); color: var(--primary-text-color); }
@@ -444,26 +451,56 @@ class BetterTodoListCard extends HTMLElement {
     const dueLabel = formatDue(task.due_date, task.due_time);
     const tagsHtml = (task.tags || []).map((t) => `<span class="chip">${escapeHtml(t)}</span>`).join("");
     const prio = task.priority ? PRIORITY_META[task.priority] : null;
+    const notes = (task.notes || "").trim();
 
     return `
       <div class="task-row ${task.status === "completed" ? "completed" : ""}">
-        <input type="checkbox" class="task-check" data-role="toggle-task" data-task-id="${task.id}" data-entry-id="${entryId}" ${task.status === "completed" ? "checked" : ""}>
-        <div class="task-main" data-action="open" data-task-id="${task.id}" data-entry-id="${entryId}">
-          <div class="task-title-row">
-            ${prio ? `<span class="prio-dot" style="background:${prio.color}" title="${prio.label} priority"></span>` : ""}
-            <span class="task-title">${escapeHtml(task.title)}</span>
-            ${task.recurrence ? `<ha-icon icon="mdi:repeat" class="recur-icon" title="Repeats"></ha-icon>` : ""}
+        <div class="task-row-main">
+          <input type="checkbox" class="task-check" data-role="toggle-task" data-task-id="${task.id}" data-entry-id="${entryId}" ${task.status === "completed" ? "checked" : ""}>
+          <div class="task-main" data-action="open" data-task-id="${task.id}" data-entry-id="${entryId}">
+            <div class="task-title-row">
+              ${prio ? `<span class="prio-dot" style="background:${prio.color}" title="${prio.label} priority"></span>` : ""}
+              <span class="task-title">${escapeHtml(task.title)}</span>
+              ${task.recurrence ? `<ha-icon icon="mdi:repeat" class="recur-icon" title="Repeats"></ha-icon>` : ""}
+            </div>
+            <div class="task-meta">
+              ${dueLabel ? `<span class="due ${overdue ? "overdue" : ""}">${escapeHtml(dueLabel)}</span>` : ""}
+              ${subLabel ? `<span class="subprogress">${subLabel}</span>` : ""}
+              ${tagsHtml}
+            </div>
+            ${notes ? `<div class="task-notes" title="${escapeHtml(notes)}">${escapeHtml(notes)}</div>` : ""}
           </div>
-          <div class="task-meta">
-            ${dueLabel ? `<span class="due ${overdue ? "overdue" : ""}">${escapeHtml(dueLabel)}</span>` : ""}
-            ${subLabel ? `<span class="subprogress">${subLabel}</span>` : ""}
-            ${tagsHtml}
-          </div>
+          <button type="button" class="icon-btn" data-action="delete" data-task-id="${task.id}" data-entry-id="${entryId}" title="Delete">
+            <ha-icon icon="mdi:delete-outline"></ha-icon>
+          </button>
         </div>
-        <button type="button" class="icon-btn" data-action="delete" data-task-id="${task.id}" data-entry-id="${entryId}" title="Delete">
-          <ha-icon icon="mdi:delete-outline"></ha-icon>
-        </button>
+        ${this._inlineSubtasksHtml(entryId, task)}
       </div>`;
+  }
+
+  // Nested checklist shown directly under a task in the main list view, so
+  // subtasks can be checked off without opening the edit dialog. Kept as a
+  // sibling of .task-row-main (not nested inside .task-main) on purpose -
+  // .task-main has data-action="open" covering its whole area, and a click
+  // on a checkbox bubbles up through its ancestors, so if these rows lived
+  // inside .task-main a subtask click would also pop open the edit dialog.
+  _inlineSubtasksHtml(entryId, task) {
+    const subs = task.subtasks || [];
+    if (!subs.length) return "";
+
+    const rows = subs
+      .map(
+        (s) => `
+        <div class="subtask-row-inline">
+          <input type="checkbox" class="subtask-check" data-role="toggle-subtask-inline"
+                 data-sub-id="${s.id}" data-task-id="${task.id}" data-entry-id="${entryId}"
+                 ${s.status === "completed" ? "checked" : ""}>
+          <span class="${s.status === "completed" ? "completed" : ""}">${escapeHtml(s.title)}</span>
+        </div>`
+      )
+      .join("");
+
+    return `<div class="subtasks-inline">${rows}</div>`;
   }
 
   // --- Delegated event handlers ------------------------------------------------
@@ -536,6 +573,25 @@ class BetterTodoListCard extends HTMLElement {
       try {
         const command = wasChecked ? "better_todo_list/complete_task" : "better_todo_list/reopen_task";
         await this._callWS({ type: command, entry_id: entryId, task_id: taskId });
+        await this._refreshTasks();
+      } catch (err) {
+        target.checked = !wasChecked;
+        this._showToastError(err);
+      }
+      return;
+    }
+    if (target.dataset && target.dataset.role === "toggle-subtask-inline") {
+      const wasChecked = target.checked;
+      const { entryId, taskId, subId } = target.dataset;
+      try {
+        const status = wasChecked ? "completed" : "needs_action";
+        await this._callWS({
+          type: "better_todo_list/update_sub_task",
+          entry_id: entryId,
+          task_id: taskId,
+          sub_task_id: subId,
+          status,
+        });
         await this._refreshTasks();
       } catch (err) {
         target.checked = !wasChecked;
