@@ -65,6 +65,9 @@ _DIFF_IGNORED_FIELDS = {
     "sub_tasks",
     "status",
     "completed_at",
+    "cycle_start",
+    "next_cycle_start",
+    "reminder_sent_for",
 }
 
 

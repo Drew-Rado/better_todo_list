@@ -43,18 +43,42 @@ instance. Try it:
         "end_date": "YYYY-MM-DD" | None,
         "max_occurrences": <int> | None,
         "occurrences_count": <int>,       # how many occurrences have happened so far
+
+        # When each cycle is due (every type except "interval: hours")
+        "due_rule": "same_day" | "days_after" | "weekday" | "end_of_month" | "before_next",
+        "due_days": <int>,                # due_rule == "days_after"
+        "due_weekday": 0-6,               # due_rule == "weekday"
     }
+
+--- Cycles: "appears on" vs "due on" ---
+
+For every type except "interval: hours", the pattern above decides when a
+task *appears* on the list (a "cycle" starts), and `due_rule` decides when
+that cycle is due. E.g. "weekly on Monday" + "before_next" appears every
+Monday and is due the following Sunday; "monthly on the 1st" +
+"end_of_month" appears on the 1st and is due on the last day of the month.
+store.py hides a completed task until its next cycle appears, and resets an
+unfinished one when that happens - see plan_cycle() and advance_cycle().
+
+"interval: hours" keeps the original behavior instead: completing it
+immediately reschedules it N hours later (compute_next_occurrence()).
 """
 from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, time, timedelta
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 try:
     # Normal case: imported as part of the custom_components.better_todo_list
     # package (i.e. by Home Assistant, or `python -m custom_components...`).
     from .const import (
+        DUE_RULE_BEFORE_NEXT,
+        DUE_RULE_DAYS_AFTER,
+        DUE_RULE_END_OF_MONTH,
+        DUE_RULE_SAME_DAY,
+        DUE_RULE_WEEKDAY,
+        DUE_RULES,
         RECURRENCE_END_COUNT,
         RECURRENCE_END_DATE,
         RECURRENCE_INTERVAL,
@@ -70,6 +94,12 @@ except ImportError:
     # standalone module instead; Python already put this file's directory
     # on sys.path for us.
     from const import (  # type: ignore[no-redef]
+        DUE_RULE_BEFORE_NEXT,
+        DUE_RULE_DAYS_AFTER,
+        DUE_RULE_END_OF_MONTH,
+        DUE_RULE_SAME_DAY,
+        DUE_RULE_WEEKDAY,
+        DUE_RULES,
         RECURRENCE_END_COUNT,
         RECURRENCE_END_DATE,
         RECURRENCE_INTERVAL,
@@ -254,18 +284,228 @@ def _find_date_matching(predicate: Callable[[date], bool], search_from: date) ->
     )
 
 
-def _find_next_date(recurrence: dict[str, Any], on_or_after: date) -> date:
+def _build_predicate(recurrence: dict[str, Any]) -> tuple[Callable[[date], bool], date]:
     start_date = _parse_date(recurrence["start_date"])
-    search_from = max(on_or_after, start_date)
     rtype = recurrence["type"]
     if rtype not in _PREDICATE_BUILDERS:
         raise RecurrenceError(f"Unknown recurrence type: {rtype!r}")
-    predicate = _PREDICATE_BUILDERS[rtype](recurrence, start_date)
-    return _find_date_matching(predicate, search_from)
+    return _PREDICATE_BUILDERS[rtype](recurrence, start_date), start_date
+
+
+def _find_next_date(recurrence: dict[str, Any], on_or_after: date) -> date:
+    predicate, start_date = _build_predicate(recurrence)
+    return _find_date_matching(predicate, max(on_or_after, start_date))
 
 
 def _is_hourly_interval(recurrence: dict[str, Any]) -> bool:
     return recurrence["type"] == RECURRENCE_INTERVAL and recurrence["interval_unit"] == "hours"
+
+
+def uses_cycles(recurrence: dict[str, Any] | None) -> bool:
+    """Whether this recurrence uses the appear/due cycle model (every type
+    except "interval: hours" - see the module docstring)."""
+    return recurrence is not None and not _is_hourly_interval(recurrence)
+
+
+# --- Cycles (appear date + due date) ---------------------------------------------
+
+
+class CyclePlan(NamedTuple):
+    """Where a cycle-based task stands. `cycle_start` is the date the
+    current cycle appeared (None = its first cycle hasn't appeared yet),
+    `due_date` that cycle's due date (or the first cycle's, if it hasn't
+    appeared yet), `next_cycle_start` when the next cycle appears (None =
+    the recurrence has ended), and `occurrences_count` how many cycles have
+    appeared so far."""
+
+    cycle_start: Optional[date]
+    due_date: Optional[date]
+    next_cycle_start: Optional[date]
+    occurrences_count: int
+
+
+def _end_date(recurrence: dict[str, Any]) -> date | None:
+    if recurrence.get("end_type") != RECURRENCE_END_DATE or not recurrence.get("end_date"):
+        return None
+    return _parse_date(recurrence["end_date"])
+
+
+def count_exhausted(recurrence: dict[str, Any], started_count: int) -> bool:
+    if recurrence.get("end_type") != RECURRENCE_END_COUNT:
+        return False
+    max_occurrences = recurrence.get("max_occurrences")
+    return max_occurrences is not None and started_count >= int(max_occurrences)
+
+
+def validate_due_rule(recurrence: dict[str, Any]) -> None:
+    """Raise RecurrenceError if the due rule fields are malformed."""
+    rule = recurrence.get("due_rule", DUE_RULE_SAME_DAY)
+    if rule not in DUE_RULES:
+        raise RecurrenceError(f"Unknown due_rule: {rule!r}")
+    if rule == DUE_RULE_DAYS_AFTER:
+        try:
+            days = int(recurrence.get("due_days"))
+        except (TypeError, ValueError) as err:
+            raise RecurrenceError("due_days must be a whole number") from err
+        if not 0 <= days <= 366:
+            raise RecurrenceError("due_days must be between 0 and 366")
+    if rule == DUE_RULE_WEEKDAY:
+        try:
+            weekday = int(recurrence.get("due_weekday"))
+        except (TypeError, ValueError) as err:
+            raise RecurrenceError("due_weekday must be 0 (Monday) to 6 (Sunday)") from err
+        if not 0 <= weekday <= 6:
+            raise RecurrenceError("due_weekday must be 0 (Monday) to 6 (Sunday)")
+
+
+def first_appearance(recurrence: dict[str, Any]) -> date | None:
+    """The first date the pattern matches on/after its start date, or None
+    if that's already past the recurrence's end date."""
+    first = _find_next_date(recurrence, _parse_date(recurrence["start_date"]))
+    end = _end_date(recurrence)
+    return None if end is not None and first > end else first
+
+
+def next_appearance_after(recurrence: dict[str, Any], after: date) -> date | None:
+    """The next date strictly after `after` the pattern matches, or None if
+    that's past the recurrence's end date."""
+    nxt = _find_next_date(recurrence, after + timedelta(days=1))
+    end = _end_date(recurrence)
+    return None if end is not None and nxt > end else nxt
+
+
+def latest_appearance_on_or_before(recurrence: dict[str, Any], day: date) -> date | None:
+    """The most recent date on/before `day` (and on/after the start date,
+    and on/before any end date) the pattern matches, or None."""
+    predicate, start_date = _build_predicate(recurrence)
+    end = _end_date(recurrence)
+    candidate = min(day, end) if end is not None else day
+    for _ in range(_MAX_DAY_STEPS):
+        if candidate < start_date:
+            return None
+        if predicate(candidate):
+            return candidate
+        candidate -= timedelta(days=1)
+    return None
+
+
+def due_date_for_cycle(recurrence: dict[str, Any], cycle_start: date) -> date:
+    """The due date of the cycle that appears on `cycle_start`."""
+    rule = recurrence.get("due_rule", DUE_RULE_SAME_DAY)
+    if rule == DUE_RULE_DAYS_AFTER:
+        return cycle_start + timedelta(days=int(recurrence.get("due_days", 0)))
+    if rule == DUE_RULE_WEEKDAY:
+        return cycle_start + timedelta(days=(int(recurrence["due_weekday"]) - cycle_start.weekday()) % 7)
+    if rule == DUE_RULE_END_OF_MONTH:
+        return cycle_start.replace(day=_last_day_of_month(cycle_start.year, cycle_start.month))
+    if rule == DUE_RULE_BEFORE_NEXT:
+        # Deliberately ignores the end date/count: the last cycle of a
+        # recurrence still gets the same amount of time as every other one.
+        nxt = _find_next_date(recurrence, cycle_start + timedelta(days=1))
+        return max(cycle_start, nxt - timedelta(days=1))
+    return cycle_start
+
+
+def _next_cycle_start(recurrence: dict[str, Any], after: date, started_count: int) -> date | None:
+    if count_exhausted(recurrence, started_count):
+        return None
+    return next_appearance_after(recurrence, after)
+
+
+def plan_cycle(recurrence: dict[str, Any], today: date) -> CyclePlan:
+    """Where a task with this (new or just-edited) recurrence stands today:
+    in the cycle that most recently appeared, or - if the pattern hasn't
+    matched yet since its start date - waiting for its first appearance."""
+    current = latest_appearance_on_or_before(recurrence, today)
+    if current is not None:
+        return CyclePlan(
+            cycle_start=current,
+            due_date=due_date_for_cycle(recurrence, current),
+            next_cycle_start=_next_cycle_start(recurrence, current, 1),
+            occurrences_count=1,
+        )
+    first = first_appearance(recurrence)
+    return CyclePlan(
+        cycle_start=None,
+        due_date=due_date_for_cycle(recurrence, first) if first else None,
+        next_cycle_start=first,
+        occurrences_count=0,
+    )
+
+
+def advance_cycle(
+    recurrence: dict[str, Any], next_cycle_start: date, today: date, started_count: int
+) -> CyclePlan | None:
+    """If the next cycle has appeared by `today`, return the new cycle's
+    plan; otherwise None. If several cycles were skipped (Home Assistant
+    was off for a while), jumps straight to the most recent one."""
+    if next_cycle_start > today:
+        return None
+    start = latest_appearance_on_or_before(recurrence, today)
+    if start is None or start < next_cycle_start:
+        start = next_cycle_start
+    count = started_count + 1
+    return CyclePlan(
+        cycle_start=start,
+        due_date=due_date_for_cycle(recurrence, start),
+        next_cycle_start=_next_cycle_start(recurrence, start, count),
+        occurrences_count=count,
+    )
+
+
+def _shift_months(day: date, months: int) -> date:
+    total = day.year * 12 + (day.month - 1) + months
+    year, month = divmod(total, 12)
+    return date(year, month + 1, min(day.day, _last_day_of_month(year, month + 1)))
+
+
+def _one_period_earlier(recurrence: dict[str, Any], start: date) -> date:
+    """`start` moved back by exactly one repeat period - which keeps every
+    "every N ..." pattern in the same phase (same weeks/months/years)."""
+    rtype = recurrence["type"]
+    if rtype == RECURRENCE_WEEKLY:
+        return start - timedelta(weeks=int(recurrence["weekly_interval"]))
+    if rtype in (RECURRENCE_MONTHLY_DAY, RECURRENCE_MONTHLY_WEEKDAY):
+        return _shift_months(start, -int(recurrence["monthly_interval"]))
+    if rtype == RECURRENCE_YEARLY:
+        return _shift_months(start, -12 * int(recurrence["yearly_interval"]))
+    value = int(recurrence["interval_value"])
+    unit = recurrence["interval_unit"]
+    if unit == "days":
+        return start - timedelta(days=value)
+    if unit == "weeks":
+        return start - timedelta(weeks=value)
+    if unit == "months":
+        return _shift_months(start, -value)
+    return _shift_months(start, -12 * value)
+
+
+def earlier_start_suggestion(recurrence: dict[str, Any], today: date) -> date | None:
+    """If this recurrence won't appear until a future date, the start date
+    that would make the *current* period's cycle appear right away instead
+    (e.g. a weekly-on-Monday task set up on a Tuesday: this past Monday).
+    None if it already has a current cycle, or there's no such date."""
+    if not uses_cycles(recurrence) or plan_cycle(recurrence, today).cycle_start is not None:
+        return None
+    start = _parse_date(recurrence["start_date"])
+    shifted = {**recurrence, "start_date": _one_period_earlier(recurrence, start).isoformat()}
+    candidate = latest_appearance_on_or_before(shifted, today)
+    return candidate if candidate is not None and candidate < start else None
+
+
+def preview_cycles(recurrence: dict[str, Any], today: date, count: int = 3) -> list[tuple[date, date]]:
+    """The (appears, due) dates of the current/first cycle and the ones
+    after it - shown in the card's task editor so you can see what a
+    repeat + due setting will actually do before saving it."""
+    plan = plan_cycle(recurrence, today)
+    appear = plan.cycle_start or plan.next_cycle_start
+    started = 1  # the first cycle listed has appeared, or will have by then
+    cycles: list[tuple[date, date]] = []
+    while appear is not None and len(cycles) < count:
+        cycles.append((appear, due_date_for_cycle(recurrence, appear)))
+        appear = _next_cycle_start(recurrence, appear, started)
+        started += 1
+    return cycles
 
 
 def _find_next_hourly(
@@ -321,6 +561,9 @@ def compute_next_occurrence(
     return the (date, time) it should be rescheduled to, or `None` if the
     recurrence has reached its end date or max repetitions and should stop
     recurring (the task then simply stays completed).
+
+    store.py only uses this for "interval: hours" recurrences - every other
+    type uses the cycle functions above instead.
 
     This does NOT mutate `recurrence` - the caller (store.py) owns
     persistence and is responsible for saving the bumped
@@ -432,6 +675,94 @@ def _self_test() -> None:  # pragma: no cover - manual debugging helper
         "yearly, already at max_occurrences",
         compute_next_occurrence(r, date(2026, 12, 24), None),
         None,
+    )
+
+    # --- Cycles: appears every Monday, due the day before the next Monday ---
+    weekly = {
+        "type": "weekly",
+        "weekly_interval": 1,
+        "weekdays": [0],
+        "start_date": "2026-09-01",
+        "end_type": "none",
+        "due_rule": "before_next",
+    }
+    check(
+        "weekly Monday cycle, planned on a Tuesday",
+        plan_cycle(weekly, date(2026, 10, 6)),
+        CyclePlan(date(2026, 10, 5), date(2026, 10, 11), date(2026, 10, 12), 1),
+    )
+    check(
+        "weekly Monday cycle, next one appears the following Monday",
+        advance_cycle(weekly, date(2026, 10, 12), date(2026, 10, 12), 1),
+        CyclePlan(date(2026, 10, 12), date(2026, 10, 18), date(2026, 10, 19), 2),
+    )
+    check(
+        "weekly Monday cycle, not time for the next one yet",
+        advance_cycle(weekly, date(2026, 10, 12), date(2026, 10, 11), 1),
+        None,
+    )
+    check(
+        "weekly Monday cycle, catching up after 3 weeks offline",
+        advance_cycle(weekly, date(2026, 10, 12), date(2026, 10, 28), 1),
+        CyclePlan(date(2026, 10, 26), date(2026, 11, 1), date(2026, 11, 2), 2),
+    )
+
+    # --- Cycles: appears on the 1st, due at the end of the month ---
+    monthly = {
+        "type": "monthly_day",
+        "monthly_interval": 1,
+        "day_of_month": 1,
+        "start_date": "2026-11-01",
+        "end_type": "none",
+        "due_rule": "end_of_month",
+    }
+    check(
+        "monthly 1st cycle, before its start date",
+        plan_cycle(monthly, date(2026, 10, 6)),
+        CyclePlan(None, date(2026, 11, 30), date(2026, 11, 1), 0),
+    )
+    check(
+        "monthly 1st cycle, first appearance",
+        advance_cycle(monthly, date(2026, 11, 1), date(2026, 11, 1), 0),
+        CyclePlan(date(2026, 11, 1), date(2026, 11, 30), date(2026, 12, 1), 1),
+    )
+
+    # --- Cycles: due on a weekday, N days after, and a 2-cycle limit ---
+    check(
+        "due on Sunday after a Wednesday appearance",
+        due_date_for_cycle({**weekly, "due_rule": "weekday", "due_weekday": 6}, date(2026, 10, 7)),
+        date(2026, 10, 11),
+    )
+    check(
+        "due 3 days after appearing",
+        due_date_for_cycle({**weekly, "due_rule": "days_after", "due_days": 3}, date(2026, 10, 5)),
+        date(2026, 10, 8),
+    )
+    limited = {**weekly, "end_type": "count", "max_occurrences": 2}
+    check(
+        "2-cycle limit, second cycle has no next",
+        advance_cycle(limited, date(2026, 10, 12), date(2026, 10, 12), 1),
+        CyclePlan(date(2026, 10, 12), date(2026, 10, 18), None, 2),
+    )
+    check(
+        "weekly Monday set up on a Tuesday: suggest starting this past Monday",
+        earlier_start_suggestion({**weekly, "start_date": "2026-10-06"}, date(2026, 10, 6)),
+        date(2026, 10, 5),
+    )
+    check(
+        "monthly 1st set up mid-month: suggest the 1st of this month",
+        earlier_start_suggestion({**monthly, "start_date": "2026-10-06"}, date(2026, 10, 6)),
+        date(2026, 10, 1),
+    )
+    check(
+        "no suggestion when a cycle is already current",
+        earlier_start_suggestion(weekly, date(2026, 10, 6)),
+        None,
+    )
+    check(
+        "preview of the weekly cycle",
+        preview_cycles(weekly, date(2026, 10, 6), 2),
+        [(date(2026, 10, 5), date(2026, 10, 11)), (date(2026, 10, 12), date(2026, 10, 18))],
     )
 
 

@@ -8,9 +8,9 @@ of the richer custom card described in websocket_api.py and
 better-todo-list-card.js.
 
 Home Assistant's built-in TodoItem only understands summary/status/due/
-description - it has no concept of priority, tags, room, subtasks, or
-recurrence, so those fields are only visible/editable through the custom
-card. Every write, from either side, goes through store.py so both stay
+description - it has no concept of priority, effort, tags, room,
+assignees, reminders, subtasks, or recurrence, so those fields are only
+visible/editable through the custom card. Every write, from either side, goes through store.py so both stay
 in sync (see store.py's `add_listener`).
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, STATUS_COMPLETED
-from .store import BetterTodoListStore
+from .store import BetterTodoListStore, is_waiting
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +81,12 @@ class BetterTodoListTodoListEntity(TodoListEntity):
 
     @property
     def todo_items(self) -> list[TodoItem]:
-        return [_task_to_todo_item(task) for task in self._store.tasks]
+        """Repeating tasks waiting for their next cycle are left out
+        entirely - not just because they're hidden in the card too, but
+        because HA's built-in Todo card has a "clear completed" button
+        that would otherwise delete them along with genuinely finished
+        one-off tasks."""
+        return [_task_to_todo_item(task) for task in self._store.tasks if not is_waiting(task)]
 
     async def async_create_todo_item(self, item: TodoItem) -> None:
         due_date, due_time = _split_due(item.due)

@@ -6,14 +6,18 @@ This file wires everything together:
                            created. Registers the WebSocket API, the
                            frontend card (as a resource HA loads
                            automatically - no manual "Add Resource" step),
-                           the `better_todo_list.*` services, and a
-                           listener that clears a task's Room whenever you
-                           delete the underlying HA Area, so tasks never
-                           point at a room that no longer exists.
+                           the `better_todo_list.*` services, the
+                           midnight/reminder timers (scheduler.py), and
+                           listeners that clear a task's Room / "Assigned
+                           to" whenever you delete the underlying HA Area
+                           or person, so tasks never point at something
+                           that no longer exists.
   * `async_setup_entry`  - runs once PER LIST (each list is its own config
                            entry - see config_flow.py). Creates that
                            list's Store, loads its saved tasks from disk,
-                           and forwards setup to the `todo` platform so it
+                           starts any repeating-task cycles that appeared
+                           while Home Assistant was off, and forwards
+                           setup to the `todo` platform so it
                            also shows up as a native todo.* entity.
 
 DEBUGGING TIP: nearly every function in this integration logs what it's
@@ -46,11 +50,16 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_integration
 
-from . import websocket_api
+from . import scheduler, websocket_api
 from .const import (
     ATTR_AREA_ID,
+    ATTR_ASSIGNEES,
     ATTR_DUE_DATE,
+    ATTR_DUE_DAYS,
+    ATTR_DUE_RULE,
     ATTR_DUE_TIME,
+    ATTR_DUE_WEEKDAY,
+    ATTR_EFFORT,
     ATTR_NOTES,
     ATTR_PRIORITY,
     ATTR_TAGS,
@@ -58,12 +67,17 @@ from .const import (
     ATTR_TITLE,
     CARD_TAG,
     DOMAIN,
+    DUE_RULE_DAYS_AFTER,
+    DUE_RULE_WEEKDAY,
+    DUE_RULES,
+    EFFORTS,
     FRONTEND_SCRIPT_URL,
     PLATFORMS,
     PRIORITIES,
     SERVICE_ADD_TASK,
     SERVICE_COMPLETE_TASK,
     SERVICE_REOPEN_TASK,
+    SERVICE_SET_DUE_RULE,
 )
 from .store import BetterTodoListStore
 
@@ -90,14 +104,24 @@ _ADD_TASK_SCHEMA = vol.Schema(
         vol.Optional(ATTR_DUE_DATE): cv.string,
         vol.Optional(ATTR_DUE_TIME): cv.string,
         vol.Optional(ATTR_PRIORITY): vol.In(PRIORITIES),
+        vol.Optional(ATTR_EFFORT): vol.In(EFFORTS),
         vol.Optional(ATTR_TAGS): [cv.string],
         vol.Optional(ATTR_AREA_ID): cv.string,
+        vol.Optional(ATTR_ASSIGNEES): cv.entity_ids,
     }
 )
 _TASK_ID_SCHEMA = vol.Schema(
     {
         vol.Required(_ATTR_ENTITY_ID): cv.entity_id,
         vol.Required(ATTR_TASK_ID): cv.string,
+    }
+)
+_SET_DUE_RULE_SCHEMA = vol.Schema(
+    {
+        vol.Required(_ATTR_ENTITY_ID): cv.entity_id,
+        vol.Required(ATTR_DUE_RULE): vol.In(DUE_RULES),
+        vol.Optional(ATTR_DUE_DAYS): vol.All(vol.Coerce(int), vol.Range(min=0, max=366)),
+        vol.Optional(ATTR_DUE_WEEKDAY): vol.All(vol.Coerce(int), vol.Range(min=0, max=6)),
     }
 )
 
@@ -110,6 +134,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     await _async_register_frontend(hass)
     _async_register_services(hass)
     _async_register_area_cleanup(hass)
+    _async_register_person_cleanup(hass)
+    scheduler.async_setup_scheduler(hass)
 
     _LOGGER.debug("Better Todo List: one-time global setup complete")
     return True
@@ -119,6 +145,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one list (one config entry)."""
     store = BetterTodoListStore(hass, entry.entry_id)
     await store.async_load()
+    await store.async_advance_cycles()
     hass.data[DOMAIN]["stores"][entry.entry_id] = store
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -138,7 +165,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when it's renamed via the options flow."""
+    """Reload the entry when it's renamed or reconfigured via the options flow."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -255,7 +282,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
     These only cover the basics (create/complete/reopen) - everything
     else (subtasks, recurrence, tags, room, editing) is meant to be done
     from the card, since those aren't things you'd typically want to
-    trigger from an automation.
+    trigger from an automation. set_due_rule is the exception: it changes
+    when every repeating task in a list is due in one go, which would
+    otherwise mean editing each task by hand.
     """
 
     async def handle_add_task(call: ServiceCall) -> None:
@@ -266,8 +295,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
             due_date=call.data.get(ATTR_DUE_DATE),
             due_time=call.data.get(ATTR_DUE_TIME),
             priority=call.data.get(ATTR_PRIORITY),
+            effort=call.data.get(ATTR_EFFORT),
             tags=call.data.get(ATTR_TAGS),
             area_id=call.data.get(ATTR_AREA_ID),
+            assignees=call.data.get(ATTR_ASSIGNEES),
             actor="Automation/script",
         )
 
@@ -279,12 +310,29 @@ def _async_register_services(hass: HomeAssistant) -> None:
         store = _resolve_store(hass, call.data[_ATTR_ENTITY_ID])
         await store.async_reopen_task(call.data[ATTR_TASK_ID], actor="Automation/script")
 
+    async def handle_set_due_rule(call: ServiceCall) -> None:
+        store = _resolve_store(hass, call.data[_ATTR_ENTITY_ID])
+        rule = call.data[ATTR_DUE_RULE]
+        fields: dict[str, object] = {ATTR_DUE_RULE: rule}
+        if rule == DUE_RULE_DAYS_AFTER:
+            if ATTR_DUE_DAYS not in call.data:
+                raise HomeAssistantError("due_days is required for the 'days_after' due rule")
+            fields[ATTR_DUE_DAYS] = call.data[ATTR_DUE_DAYS]
+        if rule == DUE_RULE_WEEKDAY:
+            if ATTR_DUE_WEEKDAY not in call.data:
+                raise HomeAssistantError("due_weekday is required for the 'weekday' due rule")
+            fields[ATTR_DUE_WEEKDAY] = call.data[ATTR_DUE_WEEKDAY]
+        await store.async_set_due_rule(fields, actor="Automation/script")
+
     hass.services.async_register(DOMAIN, SERVICE_ADD_TASK, handle_add_task, schema=_ADD_TASK_SCHEMA)
     hass.services.async_register(
         DOMAIN, SERVICE_COMPLETE_TASK, handle_complete_task, schema=_TASK_ID_SCHEMA
     )
     hass.services.async_register(
         DOMAIN, SERVICE_REOPEN_TASK, handle_reopen_task, schema=_TASK_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_DUE_RULE, handle_set_due_rule, schema=_SET_DUE_RULE_SCHEMA
     )
 
 
@@ -311,3 +359,24 @@ async def _async_clear_area_everywhere(hass: HomeAssistant, area_id: str) -> Non
     stores: dict[str, BetterTodoListStore] = hass.data[DOMAIN]["stores"]
     for store in stores.values():
         await store.async_clear_area_references(area_id)
+
+
+def _async_register_person_cleanup(hass: HomeAssistant) -> None:
+    """Remove a person from every task's "Assigned to" when that person is
+    deleted (Settings -> People), the same way the Area cleanup above
+    handles Rooms."""
+
+    @callback
+    def _handle_entity_registry_updated(event: Event) -> None:
+        entity_id = event.data.get("entity_id", "")
+        if event.data.get("action") != "remove" or not entity_id.startswith("person."):
+            return
+        hass.async_create_task(_async_clear_person_everywhere(hass, entity_id))
+
+    hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, _handle_entity_registry_updated)
+
+
+async def _async_clear_person_everywhere(hass: HomeAssistant, entity_id: str) -> None:
+    stores: dict[str, BetterTodoListStore] = hass.data[DOMAIN]["stores"]
+    for store in stores.values():
+        await store.async_clear_person_references(entity_id)

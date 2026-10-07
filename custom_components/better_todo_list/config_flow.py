@@ -21,8 +21,15 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 
-from .const import CONF_LIST_NAME, DOMAIN, MAX_TITLE_LENGTH
+from .const import (
+    CONF_LIST_NAME,
+    CONF_REMINDER_TIME,
+    DEFAULT_REMINDER_TIME,
+    DOMAIN,
+    MAX_TITLE_LENGTH,
+)
 
 
 class BetterTodoListConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -81,7 +88,9 @@ class BetterTodoListConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class BetterTodoListOptionsFlow(config_entries.OptionsFlow):
-    """Lets you rename a list after creation via its entry's "Configure" button.
+    """Lets you rename a list after creation, and set what time of day
+    reminders go out for its tasks that have a due date but no due time,
+    via its entry's "Configure" button.
 
     Deliberately has no __init__: Home Assistant deprecated (and, as of
     HA 2025.12, removed) integrations setting `self.config_entry`
@@ -110,10 +119,13 @@ class BetterTodoListOptionsFlow(config_entries.OptionsFlow):
                     title=new_name,
                     data={**self.config_entry.data, CONF_LIST_NAME: new_name},
                 )
-                # Returning an empty entry closes the options dialog. The
+                # `data` here becomes entry.options (read by scheduler.py),
+                # and creating it closes the options dialog. The
                 # entry_update_listener registered in __init__.py reloads
                 # the config entry so the todo.* entity picks up the new name.
-                return self.async_create_entry(title="", data={})
+                return self.async_create_entry(
+                    title="", data={CONF_REMINDER_TIME: user_input[CONF_REMINDER_TIME]}
+                )
 
         return self.async_show_form(
             step_id="init",
@@ -121,7 +133,13 @@ class BetterTodoListOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Required(
                         CONF_LIST_NAME, default=self.config_entry.title
-                    ): str
+                    ): str,
+                    vol.Required(
+                        CONF_REMINDER_TIME,
+                        default=self.config_entry.options.get(
+                            CONF_REMINDER_TIME, DEFAULT_REMINDER_TIME
+                        ),
+                    ): selector.TimeSelector(),
                 }
             ),
             errors=errors,

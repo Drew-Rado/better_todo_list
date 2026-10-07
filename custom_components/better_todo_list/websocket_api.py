@@ -1,7 +1,8 @@
 """Custom WebSocket API for Better Todo List.
 
 Home Assistant's built-in `todo` entity schema (see todo.py) has no room
-for priority, tags, room, subtasks, recurrence, or history - so the
+for priority, effort, tags, room, assignees, reminders, subtasks,
+recurrence, or history - so the
 custom Lovelace card (better-todo-list-card.js) talks to these
 `better_todo_list/*` WebSocket commands instead, whenever it needs one of
 those richer fields.
@@ -29,8 +30,12 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import floor_registry as fr
+from homeassistant.util import dt as dt_util
 
+from . import recurrence
 from .const import DOMAIN
+from .scheduler import notify_services_for_person
 from .store import BetterTodoListStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,11 +47,26 @@ _TASK_FIELDS_OPTIONAL = {
     vol.Optional("due_date"): vol.Any(str, None),
     vol.Optional("due_time"): vol.Any(str, None),
     vol.Optional("priority"): vol.Any(str, None),
+    vol.Optional("effort"): vol.Any(str, None),
     vol.Optional("tags"): [cv.string],
     vol.Optional("area_id"): vol.Any(str, None),
+    vol.Optional("assignees"): [cv.string],
+    vol.Optional("reminder"): vol.Any(int, None),
     vol.Optional("recurrence"): vol.Any(dict, None),
 }
-_UPDATABLE_TASK_FIELDS = ("title", "notes", "due_date", "due_time", "priority", "tags", "area_id", "recurrence")
+_UPDATABLE_TASK_FIELDS = (
+    "title",
+    "notes",
+    "due_date",
+    "due_time",
+    "priority",
+    "effort",
+    "tags",
+    "area_id",
+    "assignees",
+    "reminder",
+    "recurrence",
+)
 
 
 def _actor_name(connection: websocket_api.ActiveConnection) -> str:
@@ -109,16 +129,74 @@ async def handle_get_lists(hass, connection, msg):
 @websocket_api.websocket_command({vol.Required("type"): "better_todo_list/get_areas"})
 @websocket_api.async_response
 async def handle_get_areas(hass, connection, msg):
-    """All HA Areas, for the card's Room picker."""
-    registry = ar.async_get(hass)
-    areas = sorted(
+    """All HA Areas (the card's Rooms) and Floors, each in the order Home
+    Assistant itself shows them under Settings -> Areas, labels & zones
+    (which you can rearrange there) - the card sorts and groups by that
+    order. Floors come back as a separate list since an area's floor is
+    optional."""
+    areas = [
+        {"area_id": area.id, "name": area.name, "icon": area.icon, "floor_id": area.floor_id}
+        for area in ar.async_get(hass).async_list_areas()
+    ]
+    floors = [
+        {"floor_id": floor.floor_id, "name": floor.name, "icon": floor.icon, "level": floor.level}
+        for floor in fr.async_get(hass).async_list_floors()
+    ]
+    connection.send_result(msg["id"], {"areas": areas, "floors": floors})
+
+
+@websocket_api.websocket_command({vol.Required("type"): "better_todo_list/get_people"})
+@websocket_api.async_response
+async def handle_get_people(hass, connection, msg):
+    """Every person (Settings -> People), for the card's "Assigned to"
+    picker. `can_notify` says whether reminders can actually reach them -
+    see scheduler.notify_services_for_person."""
+    people = sorted(
         (
-            {"area_id": area.id, "name": area.name, "icon": area.icon}
-            for area in registry.async_list_areas()
+            {
+                "entity_id": state.entity_id,
+                "name": state.name,
+                "picture": state.attributes.get("entity_picture"),
+                "can_notify": bool(notify_services_for_person(hass, state.entity_id)),
+            }
+            for state in hass.states.async_all("person")
         ),
-        key=lambda a: a["name"].lower(),
+        key=lambda p: p["name"].lower(),
     )
-    connection.send_result(msg["id"], {"areas": areas})
+    connection.send_result(msg["id"], {"people": people})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "better_todo_list/preview_recurrence", vol.Required("recurrence"): dict}
+)
+@websocket_api.async_response
+async def handle_preview_recurrence(hass, connection, msg):
+    """What a repeat + due setting will do, before it's saved: the next
+    few (appears, due) dates, and - if it won't appear until later - the
+    start date that would make the current cycle appear right away. The
+    task editor shows this live while you change the settings."""
+    spec = dict(msg["recurrence"])
+    spec.setdefault("due_rule", "same_day")
+    today = dt_util.now().date()
+    try:
+        recurrence.validate_due_rule(spec)
+        if not recurrence.uses_cycles(spec):
+            connection.send_result(msg["id"], {"uses_cycles": False, "cycles": [], "earlier_start": None})
+            return
+        cycles = recurrence.preview_cycles(spec, today)
+        earlier = recurrence.earlier_start_suggestion(spec, today)
+    except (recurrence.RecurrenceError, KeyError, TypeError, ValueError) as err:
+        connection.send_error(msg["id"], "invalid_recurrence", str(err))
+        return
+    connection.send_result(
+        msg["id"],
+        {
+            "uses_cycles": True,
+            "today": today.isoformat(),
+            "cycles": [{"appears": a.isoformat(), "due": d.isoformat()} for a, d in cycles],
+            "earlier_start": earlier.isoformat() if earlier else None,
+        },
+    )
 
 
 # --- Tasks --------------------------------------------------------------------
@@ -155,8 +233,11 @@ async def handle_create_task(hass, connection, msg):
             due_date=msg.get("due_date"),
             due_time=msg.get("due_time"),
             priority=msg.get("priority"),
+            effort=msg.get("effort"),
             tags=msg.get("tags"),
             area_id=msg.get("area_id"),
+            assignees=msg.get("assignees"),
+            reminder=msg.get("reminder"),
             recurrence_spec=msg.get("recurrence"),
             actor=_actor_name(connection),
         )
@@ -388,6 +469,8 @@ def async_register_commands(hass: HomeAssistant) -> None:
     for handler in (
         handle_get_lists,
         handle_get_areas,
+        handle_get_people,
+        handle_preview_recurrence,
         handle_get_tasks,
         handle_create_task,
         handle_update_task,

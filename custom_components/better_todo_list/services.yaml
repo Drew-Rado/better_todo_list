@@ -50,6 +50,15 @@ add_task:
             - "low"
             - "medium"
             - "high"
+    effort:
+      name: Level of effort
+      description: How much effort the task takes.
+      selector:
+        select:
+          options:
+            - "low"
+            - "medium"
+            - "high"
     tags:
       name: Tags
       description: A list of tags to attach to the task, e.g. ["chores", "weekly"].
@@ -60,12 +69,20 @@ add_task:
       description: The Home Assistant Area to use as this task's Room.
       selector:
         area:
+    assignees:
+      name: Assigned to
+      description: People (person.* entities) the task is assigned to.
+      selector:
+        entity:
+          domain: person
+          multiple: true
 
 complete_task:
   name: Complete task
   description: >-
-    Mark a task complete. If the task recurs, this automatically reschedules
-    it to its next occurrence instead of leaving it marked done.
+    Mark a task complete. A repeating task stays completed (and hidden) until
+    its next cycle appears; one that repeats every N hours is rescheduled
+    right away instead.
   fields:
     entity_id:
       name: List
@@ -104,3 +121,65 @@ reopen_task:
       required: true
       selector:
         text:
+
+set_due_rule:
+  name: Set due rule for all repeating tasks
+  description: >-
+    Change when every repeating task in a list is due, relative to the day
+    each cycle appears - e.g. make a whole "Weekly Chores" list due the day
+    before it repeats. Saves editing each task one by one. Tasks that repeat
+    every N hours aren't affected.
+  fields:
+    entity_id:
+      name: List
+      description: The todo.* entity for the list to change.
+      required: true
+      selector:
+        entity:
+          domain: todo
+          integration: better_todo_list
+    due_rule:
+      name: Due
+      description: When each cycle is due.
+      required: true
+      selector:
+        select:
+          options:
+            - label: "The day it appears"
+              value: "same_day"
+            - label: "A number of days after it appears (set Days)"
+              value: "days_after"
+            - label: "On a weekday (set Weekday)"
+              value: "weekday"
+            - label: "The last day of the month"
+              value: "end_of_month"
+            - label: "The day before it repeats"
+              value: "before_next"
+    due_days:
+      name: Days
+      description: For "a number of days after it appears".
+      selector:
+        number:
+          min: 0
+          max: 366
+          mode: box
+    due_weekday:
+      name: Weekday
+      description: For "on a weekday" - 0 is Monday, 6 is Sunday.
+      selector:
+        select:
+          options:
+            - label: "Monday"
+              value: "0"
+            - label: "Tuesday"
+              value: "1"
+            - label: "Wednesday"
+              value: "2"
+            - label: "Thursday"
+              value: "3"
+            - label: "Friday"
+              value: "4"
+            - label: "Saturday"
+              value: "5"
+            - label: "Sunday"
+              value: "6"

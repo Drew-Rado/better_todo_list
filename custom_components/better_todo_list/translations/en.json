@@ -21,9 +21,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Rename this list",
+        "title": "List settings",
         "data": {
-          "list_name": "List name"
+          "list_name": "List name",
+          "reminder_time": "Reminder time"
+        },
+        "data_description": {
+          "reminder_time": "When reminders are sent for tasks in this list that have a due date but no due time (e.g. a '1 day before' reminder for a task due Sunday goes out Saturday at this time)."
         }
       }
     },

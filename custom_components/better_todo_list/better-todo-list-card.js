@@ -19,14 +19,26 @@
  * focus/cursor position while the user is typing". Without one, the classic
  * bug is: re-render the whole card -> the <input> you were typing in gets
  * destroyed and recreated -> you lose focus and your cursor jumps around.
- * This file avoids that by keeping three SEPARATE, independently-rendered
+ * This file avoids that by keeping SEPARATE, independently-rendered
  * regions instead of one big one:
- *   #toolbar-root  - the search box / filters (rendered once)
+ *   #toolbar-root  - the search box / group / sort / filter controls
+ *   #filter-root   - the filter chips panel (re-rendered when a chip is toggled)
  *   #groups-root   - the task list itself (re-rendered after data changes)
  *   #dialog-root   - the add/edit task popup (only rendered while open)
  * As long as you're typing in a field, nothing re-renders that field's
  * container until you submit or trigger a structural change (like
  * switching the recurrence type). See _onSubmit/_openDialog/_closeDialog.
+ *
+ * --- Grouping, sorting and filtering ---
+ * "Group by" decides the section headers, "Sort" orders the tasks inside
+ * each section, and the filter chips narrow down which tasks show at all
+ * (any chip within a row matches, and every row with a chip selected must
+ * match). Sorting never breaks a grouping apart - but when the sort is
+ * about the same thing as the grouping (e.g. group by room + sort by floor),
+ * it also orders the sections, and group-by-room + sort-by-floor adds floor
+ * headings above the rooms. Floors and rooms follow the order Home
+ * Assistant shows them in under Settings -> Areas, labels & zones. Your
+ * last view is remembered per card in this browser (localStorage).
  *
  * DEBUGGING TIP: open your browser's DevTools (F12) -> Console tab for any
  * JS errors, and the Network -> WS tab to watch the actual
@@ -38,6 +50,7 @@
 // 0 = Monday .. 6 = Sunday, matching Python's `date.weekday()` used by
 // recurrence.py on the backend - keep this ordering in sync with that file.
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 const NTH_WEEK_OPTIONS = [
   ["1", "1st"],
@@ -55,7 +68,44 @@ const RECURRENCE_TYPE_OPTIONS = [
   ["yearly", "Yearly anniversary"],
 ];
 
-const GROUP_LABELS = { room: "Group by room", list: "Group by list", none: "No grouping" };
+// Keep in sync with const.DUE_RULES on the backend.
+const DUE_RULE_OPTIONS = [
+  ["same_day", "The day it appears"],
+  ["before_next", "The day before it repeats"],
+  ["end_of_month", "The last day of the month"],
+  ["weekday", "On a weekday..."],
+  ["days_after", "A number of days after it appears..."],
+];
+
+// Keep in sync with const.REMINDER_OFFSETS_MINUTES on the backend.
+const REMINDER_OPTIONS = [
+  ["", "No reminder"],
+  ["0", "When it's due"],
+  ["60", "1 hour before"],
+  ["180", "3 hours before"],
+  ["1440", "1 day before"],
+  ["2880", "2 days before"],
+  ["10080", "1 week before"],
+];
+
+const GROUP_LABELS = {
+  room: "Group by room",
+  floor: "Group by floor",
+  list: "Group by list",
+  priority: "Group by priority",
+  effort: "Group by effort",
+  none: "No grouping",
+};
+
+const SORT_LABELS = {
+  default: "Sort: priority, then due",
+  due: "Sort: due date",
+  priority: "Sort: priority",
+  effort: "Sort: effort",
+  floor: "Sort: floor",
+  tag: "Sort: tag",
+  title: "Sort: title",
+};
 
 const PRIORITY_META = {
   low: { label: "Low", color: "#4caf50" },
@@ -63,7 +113,29 @@ const PRIORITY_META = {
   high: { label: "High", color: "#f44336" },
 };
 
+const EFFORT_META = {
+  low: { label: "Low effort", icon: "mdi:gauge-low" },
+  medium: { label: "Medium effort", icon: "mdi:gauge" },
+  high: { label: "High effort", icon: "mdi:gauge-full" },
+};
+
+// "First" in each order; the reverse button flips them. Tasks without a
+// value always go last either way.
 const PRIORITY_SORT_ORDER = { high: 0, medium: 1, low: 2 };
+const EFFORT_SORT_ORDER = { low: 0, medium: 1, high: 2 };
+
+const FILTER_KEYS = ["priority", "effort", "floor", "room", "assignee", "tag", "due"];
+
+const DUE_FILTER_OPTIONS = [
+  ["overdue", "Overdue"],
+  ["today", "Today"],
+  ["week", "Next 7 days"],
+  ["later", "Later"],
+  ["none", "No due date"],
+];
+
+const NOTICE_DURATION_MS = 6000;
+const NO_FLOOR_ORDER = 1e6;
 
 // --- Small pure helper functions ------------------------------------------------
 
@@ -73,14 +145,27 @@ function escapeHtml(value) {
   ));
 }
 
-function todayIso() {
-  const d = new Date();
+function isoDate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-function formatDateHuman(isoDate) {
-  const [y, m, d] = isoDate.split("-").map(Number);
+function todayIso() {
+  return isoDate(new Date());
+}
+
+function addDaysIso(iso, days) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return isoDate(new Date(y, m - 1, d + days));
+}
+
+function formatDateHuman(isoDateStr) {
+  const [y, m, d] = isoDateStr.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatDateShort(isoDateStr) {
+  const [y, m, d] = isoDateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 }
 
 function formatDue(dueDate, dueTime) {
@@ -92,6 +177,26 @@ function isOverdue(task) {
   if (task.status === "completed" || !task.due_date) return false;
   const due = new Date(`${task.due_date}T${task.due_time || "23:59"}:00`);
   return due.getTime() < Date.now();
+}
+
+function usesCycles(recurrence) {
+  return !!recurrence && !(recurrence.type === "interval" && recurrence.interval_unit === "hours");
+}
+
+// A repeating task that's hidden until its next cycle appears - the same
+// rule as store.is_waiting() on the backend.
+function isWaiting(task) {
+  if (!task.next_cycle_start || !usesCycles(task.recurrence)) return false;
+  return !task.cycle_start || task.status === "completed";
+}
+
+function dueBucket(task) {
+  if (!task.due_date) return "none";
+  if (isOverdue(task)) return "overdue";
+  const today = todayIso();
+  if (task.due_date === today) return "today";
+  if (task.due_date <= addDaysIso(today, 7)) return "week";
+  return "later";
 }
 
 function subtaskProgressLabel(task) {
@@ -120,7 +225,9 @@ function historyDescription(entry) {
   if (entry.action === "created") return "Task created";
   if (entry.action === "completed") return "Marked complete";
   if (entry.action === "reopened") return "Reopened";
-  if (entry.action === "recurred") return `Rescheduled to next occurrence (${entry.new || "?"})`;
+  if (entry.action === "recurred") return `New cycle started (due ${entry.new || "?"})`;
+  if (entry.action === "missed") return `Not completed before the next cycle started (was due ${entry.old || "?"})`;
+  if (entry.action === "reminded") return `Reminder sent${entry.new ? ` to ${entry.new}` : ""}`;
   if (entry.action === "updated" && entry.field) {
     return `Changed ${entry.field}: ${formatHistoryValue(entry.old)} -> ${formatHistoryValue(entry.new)}`;
   }
@@ -138,6 +245,19 @@ function compareTasks(a, b) {
   return a.title.localeCompare(b.title);
 }
 
+// Compares two sort values of the same kind: numbers, strings, or arrays of those.
+function compareValues(a, b) {
+  if (Array.isArray(a)) {
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      const c = compareValues(a[i], b[i]);
+      if (c) return c;
+    }
+    return 0;
+  }
+  if (typeof a === "string") return a.localeCompare(b);
+  return a - b;
+}
+
 // --- CSS ------------------------------------------------------------------------
 // Uses Home Assistant's theme CSS variables (--primary-color etc.) so the
 // card matches the user's light/dark theme automatically instead of
@@ -148,21 +268,37 @@ const CARD_CSS = `
   ha-card { padding: 8px 0 12px; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 0 16px 8px; }
   .toolbar input[type="search"] { flex: 1 1 140px; min-width: 100px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); }
-  .toolbar select { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); }
+  .toolbar select { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); max-width: 100%; }
   .toolbar label.show-completed { display: flex; align-items: center; gap: 4px; font-size: 0.9em; color: var(--secondary-text-color); white-space: nowrap; }
   .toolbar button { border: none; border-radius: 6px; background: var(--primary-color); color: var(--text-primary-color, #fff); padding: 6px 12px; cursor: pointer; font-size: 0.9em; }
   .toolbar button.icon-btn { background: transparent; color: var(--secondary-text-color); padding: 4px 8px; font-size: 1.1em; }
+  .toolbar button.toggle-btn { background: transparent; color: var(--secondary-text-color); border: 1px solid var(--divider-color); padding: 5px 10px; }
+  .toolbar button.toggle-btn.on { border-color: var(--primary-color); color: var(--primary-color); }
+
+  .filter-panel { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 10px; }
+  .filter-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .filter-row .filter-label { font-size: 0.78em; text-transform: uppercase; letter-spacing: .04em; color: var(--secondary-text-color); min-width: 72px; }
+  .fchip { border: 1px solid var(--divider-color); border-radius: 14px; padding: 2px 10px; font: inherit; font-size: 0.82em; background: transparent; color: var(--primary-text-color); cursor: pointer; }
+  .fchip.on { background: var(--primary-color); border-color: var(--primary-color); color: var(--text-primary-color, #fff); }
+  .filter-actions { display: flex; justify-content: flex-end; }
+  .link-btn { background: none; border: none; color: var(--primary-color); cursor: pointer; font: inherit; font-size: 0.85em; padding: 2px 0; }
+
+  .notice { margin: 0 16px 8px; padding: 8px 12px; border-radius: 8px; background: var(--secondary-background-color, rgba(127,127,127,0.12)); color: var(--primary-text-color); font-size: 0.88em; }
 
   .empty-state, .error-state { padding: 24px 16px; text-align: center; color: var(--secondary-text-color); }
   .error-state { color: var(--error-color, #db4437); }
 
+  .floor-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px 2px; font-weight: 600; font-size: 0.92em; color: var(--primary-text-color); }
+  .floor-header ha-icon { --mdc-icon-size: 18px; color: var(--secondary-text-color); }
   .group { margin: 8px 0; }
+  .group.nested .group-header { padding-left: 28px; }
   .group-header { display: flex; align-items: center; gap: 8px; padding: 4px 16px; font-weight: 500; color: var(--secondary-text-color); text-transform: uppercase; font-size: 0.78em; letter-spacing: .04em; }
   .group-header .count { background: var(--divider-color); border-radius: 10px; padding: 0 6px; font-size: 0.9em; }
 
   .task-row { padding: 8px 16px; border-bottom: 1px solid var(--divider-color); }
   .task-row:last-child { border-bottom: none; }
   .task-row.completed .task-title { text-decoration: line-through; color: var(--secondary-text-color); }
+  .task-row.waiting { opacity: 0.7; }
   .task-row-main { display: flex; align-items: flex-start; gap: 10px; }
   .task-check { margin-top: 3px; width: 18px; height: 18px; flex: none; }
   .task-main { flex: 1; min-width: 0; cursor: pointer; }
@@ -172,7 +308,8 @@ const CARD_CSS = `
   .recur-icon { --mdc-icon-size: 16px; color: var(--secondary-text-color); }
   .task-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; font-size: 0.82em; color: var(--secondary-text-color); align-items: center; }
   .task-meta .due.overdue { color: var(--error-color, #db4437); font-weight: 500; }
-  .chip { background: var(--divider-color); border-radius: 10px; padding: 1px 8px; }
+  .chip { background: var(--divider-color); border-radius: 10px; padding: 1px 8px; display: inline-flex; align-items: center; gap: 3px; }
+  .chip ha-icon { --mdc-icon-size: 13px; }
   .task-notes { margin-top: 4px; font-size: 0.85em; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .subtasks-inline { display: flex; flex-direction: column; gap: 3px; margin: 6px 0 0 28px; padding-left: 8px; border-left: 2px solid var(--divider-color); }
   .subtask-row-inline { display: flex; align-items: center; gap: 6px; font-size: 0.88em; }
@@ -189,11 +326,16 @@ const CARD_CSS = `
   #task-form input, #task-form select, #task-form textarea { font: inherit; padding: 7px 8px; border-radius: 6px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); box-sizing: border-box; }
   #task-form textarea { resize: vertical; min-height: 44px; }
   .field-row { display: flex; gap: 10px; }
-  .field-row > label { flex: 1; }
+  .field-row > label { flex: 1; min-width: 0; }
   fieldset.recurrence-fieldset { border: 1px solid var(--divider-color); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
   fieldset.recurrence-fieldset legend { padding: 0 4px; font-size: 0.9em; color: var(--primary-text-color); }
-  .weekday-picker { display: flex; flex-wrap: wrap; gap: 6px; }
-  .weekday-chip { flex-direction: row !important; align-items: center; gap: 4px !important; border: 1px solid var(--divider-color); border-radius: 14px; padding: 3px 8px; font-size: 0.85em; }
+  #recurrence-fields, #due-rule-block { display: flex; flex-direction: column; gap: 10px; }
+  .recurrence-preview .link-btn { align-self: flex-start; text-align: left; }
+  .weekday-picker, .chip-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+  .weekday-chip, .pick-chip { flex-direction: row !important; align-items: center; gap: 4px !important; border: 1px solid var(--divider-color); border-radius: 14px; padding: 3px 8px; font-size: 0.85em; }
+  .recurrence-preview { display: flex; flex-direction: column; gap: 4px; font-size: 0.85em; color: var(--secondary-text-color); background: var(--secondary-background-color, rgba(127,127,127,0.08)); border-radius: 6px; padding: 8px; }
+  .recurrence-preview strong { color: var(--primary-text-color); font-weight: 500; }
+  .recurrence-preview .preview-error { color: var(--error-color, #db4437); }
   .hint { font-size: 0.8em; color: var(--secondary-text-color); font-weight: normal; }
   .section-label { font-size: 0.85em; color: var(--secondary-text-color); font-weight: 500; }
   .subtasks-block { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--divider-color); padding-top: 10px; }
@@ -226,14 +368,23 @@ class BetterTodoListCard extends HTMLElement {
 
     this._lists = [];
     this._areas = [];
+    this._floors = [];
+    this._people = [];
     this._entryIds = [];
     this._tasksByEntry = {};
     this._groupBy = "room";
+    this._sortBy = "default";
+    this._sortReverse = false;
+    this._filters = this._emptyFilters();
     this._showCompleted = false;
+    this._filterPanelOpen = false;
     this._searchText = "";
     this._loaded = false;
     this._dialogState = null;
     this._searchDebounceTimer = null;
+    this._previewDebounceTimer = null;
+    this._previewToken = 0;
+    this._noticeTimer = null;
     this._watchedEntityIds = new Set();
     this._syncDebounceTimer = null;
 
@@ -241,11 +392,15 @@ class BetterTodoListCard extends HTMLElement {
       <style>${CARD_CSS}</style>
       <ha-card>
         <div id="toolbar-root"></div>
+        <div id="filter-root"></div>
+        <div id="notice-root"></div>
         <div id="groups-root"><div class="empty-state">Loading...</div></div>
       </ha-card>
       <div id="dialog-root"></div>
     `;
     this._toolbarRoot = this.shadowRoot.getElementById("toolbar-root");
+    this._filterRoot = this.shadowRoot.getElementById("filter-root");
+    this._noticeRoot = this.shadowRoot.getElementById("notice-root");
     this._groupsRoot = this.shadowRoot.getElementById("groups-root");
     this._dialogRoot = this.shadowRoot.getElementById("dialog-root");
 
@@ -264,12 +419,16 @@ class BetterTodoListCard extends HTMLElement {
   setConfig(config) {
     if (!config) throw new Error("Invalid configuration");
     this._config = config;
-    if (config.group_by) this._groupBy = config.group_by;
-    if (config.show_completed) this._showCompleted = true;
+    this._applyView(this._configView());
+    const saved = this._loadSavedView();
+    if (saved) this._applyView(saved);
 
     const cardEl = this.shadowRoot.querySelector("ha-card");
     if (cardEl) cardEl.header = config.title || "";
-    if (this._toolbarRoot) this._renderToolbar();
+    if (this._toolbarRoot) {
+      this._renderToolbar();
+      this._renderFilterPanel();
+    }
   }
 
   set hass(hass) {
@@ -328,6 +487,81 @@ class BetterTodoListCard extends HTMLElement {
     return { type: "custom:better-todo-list-card" };
   }
 
+  // --- View state (group / sort / filters), remembered per card -----------------
+
+  _emptyFilters() {
+    return Object.fromEntries(FILTER_KEYS.map((k) => [k, new Set()]));
+  }
+
+  // The view the card's YAML config asks for - also what "reset" goes back to.
+  _configView() {
+    const c = this._config || {};
+    return {
+      groupBy: c.group_by || "room",
+      sortBy: c.sort_by || "default",
+      sortReverse: !!c.sort_reverse,
+      showCompleted: !!c.show_completed,
+      filters: c.filters || {},
+    };
+  }
+
+  _applyView(view) {
+    if (GROUP_LABELS[view.groupBy]) this._groupBy = view.groupBy;
+    if (SORT_LABELS[view.sortBy]) this._sortBy = view.sortBy;
+    this._sortReverse = !!view.sortReverse;
+    this._showCompleted = !!view.showCompleted;
+    this._filters = this._emptyFilters();
+    for (const key of FILTER_KEYS) {
+      const values = view.filters && view.filters[key];
+      if (Array.isArray(values)) values.forEach((v) => this._filters[key].add(String(v)));
+    }
+  }
+
+  _currentView() {
+    return {
+      groupBy: this._groupBy,
+      sortBy: this._sortBy,
+      sortReverse: this._sortReverse,
+      showCompleted: this._showCompleted,
+      filters: Object.fromEntries(FILTER_KEYS.map((k) => [k, [...this._filters[k]]])),
+    };
+  }
+
+  // Saved views are tagged with the config they were made under, so
+  // editing the card's YAML (e.g. a new group_by) takes effect instead of
+  // being silently overridden by an old saved view.
+  _viewStorageKey() {
+    const c = this._config || {};
+    return `better-todo-list-card:view:${c.list_name || "*"}:${c.title || ""}`;
+  }
+
+  _loadSavedView() {
+    try {
+      const raw = window.localStorage.getItem(this._viewStorageKey());
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      if (saved.configView !== JSON.stringify(this._configView())) return null;
+      return saved.view;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _saveView() {
+    try {
+      window.localStorage.setItem(
+        this._viewStorageKey(),
+        JSON.stringify({ configView: JSON.stringify(this._configView()), view: this._currentView() })
+      );
+    } catch (err) {
+      // Storage unavailable (private browsing etc.) - the view just isn't remembered.
+    }
+  }
+
+  _activeFilterCount() {
+    return FILTER_KEYS.reduce((n, k) => n + this._filters[k].size, 0);
+  }
+
   // --- Data loading ---------------------------------------------------------------
 
   async _callWS(msg) {
@@ -337,12 +571,15 @@ class BetterTodoListCard extends HTMLElement {
 
   async _loadAll() {
     try {
-      const [{ lists }, { areas }] = await Promise.all([
+      const [{ lists }, { areas, floors }, { people }] = await Promise.all([
         this._callWS({ type: "better_todo_list/get_lists" }),
         this._callWS({ type: "better_todo_list/get_areas" }),
+        this._callWS({ type: "better_todo_list/get_people" }),
       ]);
       this._lists = lists;
       this._areas = areas;
+      this._floors = floors || [];
+      this._people = people || [];
       this._entryIds = this._resolveEntryIds(lists);
       this._watchedEntityIds = new Set(
         lists
@@ -376,6 +613,7 @@ class BetterTodoListCard extends HTMLElement {
       this._tasksByEntry[entryId] = results[i].tasks;
     });
     this._renderGroups();
+    if (this._filterPanelOpen) this._renderFilterPanel();
   }
 
   _listName(entryId) {
@@ -383,74 +621,295 @@ class BetterTodoListCard extends HTMLElement {
     return entry ? entry.name : entryId;
   }
 
+  _area(areaId) {
+    return this._areas.find((a) => a.area_id === areaId) || null;
+  }
+
   _areaName(areaId) {
-    const area = this._areas.find((a) => a.area_id === areaId);
+    const area = this._area(areaId);
     return area ? area.name : null;
+  }
+
+  _areaIndex(areaId) {
+    const index = this._areas.findIndex((a) => a.area_id === areaId);
+    return index === -1 ? NO_FLOOR_ORDER : index;
+  }
+
+  _floorOf(task) {
+    const area = task.area_id ? this._area(task.area_id) : null;
+    return area && area.floor_id ? this._floors.find((f) => f.floor_id === area.floor_id) || null : null;
+  }
+
+  _floorIndex(floorId) {
+    const index = this._floors.findIndex((f) => f.floor_id === floorId);
+    return index === -1 ? NO_FLOOR_ORDER : index;
+  }
+
+  _personName(entityId) {
+    const person = this._people.find((p) => p.entity_id === entityId);
+    return person ? person.name : entityId.replace(/^person\./, "");
   }
 
   _findTask(entryId, taskId) {
     return (this._tasksByEntry[entryId] || []).find((t) => t.id === taskId) || null;
   }
 
+  _allTasks() {
+    return this._entryIds.flatMap((entryId) => this._tasksByEntry[entryId] || []);
+  }
+
   // --- Toolbar ---------------------------------------------------------------
 
   _renderToolbar() {
-    const groupOptions = Object.keys(GROUP_LABELS)
-      .map((g) => `<option value="${g}" ${this._groupBy === g ? "selected" : ""}>${GROUP_LABELS[g]}</option>`)
-      .join("");
+    const options = (labels, current) =>
+      Object.keys(labels)
+        .map((k) => `<option value="${k}" ${current === k ? "selected" : ""}>${labels[k]}</option>`)
+        .join("");
+    const filterCount = this._activeFilterCount();
     this._toolbarRoot.innerHTML = `
       <div class="toolbar">
         <input type="search" id="search" placeholder="Search tasks..." value="${escapeHtml(this._searchText)}">
-        <label class="show-completed">
+        <label class="show-completed" title="Also shows repeating tasks that are waiting for their next cycle">
           <input type="checkbox" id="show-completed" ${this._showCompleted ? "checked" : ""}>
           Show completed
         </label>
-        <select id="group-by">${groupOptions}</select>
+        <select id="group-by" aria-label="Group by">${options(GROUP_LABELS, this._groupBy)}</select>
+        <select id="sort-by" aria-label="Sort by">${options(SORT_LABELS, this._sortBy)}</select>
+        <button type="button" class="toggle-btn ${this._sortReverse ? "on" : ""}" data-action="sort-reverse"
+                title="Reverse the sort order" aria-pressed="${this._sortReverse}">&#8645;</button>
+        <button type="button" class="toggle-btn ${filterCount ? "on" : ""}" data-action="toggle-filters"
+                aria-expanded="${this._filterPanelOpen}">Filter${filterCount ? ` (${filterCount})` : ""}</button>
         <button type="button" class="icon-btn" data-action="refresh" title="Refresh">&#8635;</button>
         <button type="button" data-action="add-task">+ Add task</button>
       </div>
     `;
   }
 
-  // --- Task list -------------------------------------------------------------
+  // Each filter row: [key, label, [[value, label], ...]]. Rooms and tags
+  // only list ones actually used by a task (plus any already selected), so
+  // a house with 30 Areas doesn't get 30 chips for rooms without tasks.
+  _filterRows() {
+    const tasks = this._allTasks();
+    const usedAreas = new Set(tasks.map((t) => t.area_id).filter(Boolean));
+    const usedTags = new Map();
+    for (const t of tasks) for (const tag of t.tags || []) usedTags.set(tag.toLowerCase(), tag);
+    for (const tag of this._filters.tag) if (!usedTags.has(tag)) usedTags.set(tag, tag);
+
+    const rows = [
+      ["priority", "Priority", [["high", "High"], ["medium", "Medium"], ["low", "Low"], ["none", "None"]]],
+      ["effort", "Effort", [["low", "Low"], ["medium", "Medium"], ["high", "High"], ["none", "None"]]],
+    ];
+    if (this._floors.length) {
+      rows.push(["floor", "Floor", [...this._floors.map((f) => [f.floor_id, f.name]), ["none", "No floor"]]]);
+    }
+    const rooms = this._areas
+      .filter((a) => usedAreas.has(a.area_id) || this._filters.room.has(a.area_id))
+      .map((a) => [a.area_id, a.name]);
+    if (rooms.length) rows.push(["room", "Room", [...rooms, ["none", "No room"]]]);
+    if (this._people.length) {
+      rows.push(["assignee", "Assigned", [...this._people.map((p) => [p.entity_id, p.name]), ["none", "Unassigned"]]]);
+    }
+    if (usedTags.size) {
+      const tagOptions = [...usedTags.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+      rows.push(["tag", "Tag", [...tagOptions, ["none", "No tags"]]]);
+    }
+    rows.push(["due", "Due", DUE_FILTER_OPTIONS]);
+    return rows;
+  }
+
+  _renderFilterPanel() {
+    if (!this._filterPanelOpen) {
+      this._filterRoot.innerHTML = "";
+      return;
+    }
+    const rowsHtml = this._filterRows()
+      .map(([key, label, options]) => `
+        <div class="filter-row">
+          <span class="filter-label">${label}</span>
+          ${options
+            .map(([value, text]) => {
+              const on = this._filters[key].has(value);
+              return `<button type="button" class="fchip ${on ? "on" : ""}" data-action="filter-chip"
+                        data-key="${key}" data-value="${escapeHtml(value)}" aria-pressed="${on}">${escapeHtml(text)}</button>`;
+            })
+            .join("")}
+        </div>`)
+      .join("");
+    this._filterRoot.innerHTML = `
+      <div class="filter-panel">
+        ${rowsHtml}
+        <div class="filter-actions">
+          ${this._activeFilterCount() ? `<button type="button" class="link-btn" data-action="clear-filters">Clear filters</button>` : ""}
+        </div>
+      </div>`;
+  }
+
+  _onViewChanged() {
+    this._saveView();
+    this._renderToolbar();
+    this._renderFilterPanel();
+    this._renderGroups();
+  }
+
+  // --- Task list: filtering ------------------------------------------------------
+
+  _filterValues(key, task) {
+    switch (key) {
+      case "priority":
+        return [task.priority || "none"];
+      case "effort":
+        return [task.effort || "none"];
+      case "floor": {
+        const floor = this._floorOf(task);
+        return [floor ? floor.floor_id : "none"];
+      }
+      case "room":
+        return [task.area_id || "none"];
+      case "assignee":
+        return (task.assignees || []).length ? task.assignees : ["none"];
+      case "tag":
+        return (task.tags || []).length ? task.tags.map((t) => t.toLowerCase()) : ["none"];
+      case "due":
+        return [dueBucket(task)];
+      default:
+        return [];
+    }
+  }
+
+  _passesFilters(task) {
+    return FILTER_KEYS.every((key) => {
+      const selected = this._filters[key];
+      return !selected.size || this._filterValues(key, task).some((v) => selected.has(v));
+    });
+  }
 
   _flattenVisibleTasks() {
     const search = (this._searchText || "").trim().toLowerCase();
     const rows = [];
     for (const entryId of this._entryIds) {
       for (const task of this._tasksByEntry[entryId] || []) {
-        if (!this._showCompleted && task.status === "completed") continue;
+        if (!this._showCompleted && (task.status === "completed" || isWaiting(task))) continue;
         if (search) {
           const haystack = [task.title, task.notes, ...(task.tags || [])].filter(Boolean).join(" ").toLowerCase();
           if (!haystack.includes(search)) continue;
         }
+        if (!this._passesFilters(task)) continue;
         rows.push({ entryId, task });
       }
     }
-    rows.sort((a, b) => compareTasks(a.task, b.task));
+    rows.sort((a, b) => this._compareRows(a.task, b.task));
     return rows;
   }
 
+  // --- Task list: sorting -------------------------------------------------------
+
+  // The value a task sorts by for the current "Sort", or null if it has
+  // none (those always sort last, whichever direction).
+  _sortValue(task) {
+    switch (this._sortBy) {
+      case "due":
+        return task.due_date ? `${task.due_date}T${task.due_time || "24:00"}` : null;
+      case "priority":
+        return task.priority ? PRIORITY_SORT_ORDER[task.priority] : null;
+      case "effort":
+        return task.effort ? EFFORT_SORT_ORDER[task.effort] : null;
+      case "floor": {
+        if (!task.area_id) return null;
+        const floor = this._floorOf(task);
+        return [floor ? this._floorIndex(floor.floor_id) : NO_FLOOR_ORDER, this._areaIndex(task.area_id)];
+      }
+      case "tag":
+        return (task.tags || []).length ? task.tags.map((t) => t.toLowerCase()).sort().join("\u0000") : null;
+      case "title":
+        return task.title.toLowerCase();
+      default:
+        return null;
+    }
+  }
+
+  _compareRows(a, b) {
+    if (a.status !== b.status) return a.status === "completed" ? 1 : -1;
+    const direction = this._sortReverse ? -1 : 1;
+    if (this._sortBy === "default") return direction * compareTasks(a, b);
+    const va = this._sortValue(a);
+    const vb = this._sortValue(b);
+    if (va === null && vb !== null) return 1;
+    if (vb === null && va !== null) return -1;
+    if (va !== null && vb !== null) {
+      const c = compareValues(va, vb);
+      if (c) return direction * c;
+    }
+    return compareTasks(a, b);
+  }
+
+  // --- Task list: grouping ------------------------------------------------------
+
+  // Section key for a task under the current "Group by". `order` sorts the
+  // sections; `floor` (group-by-room + sort-by-floor only) adds a floor
+  // heading above each run of rooms on the same floor.
   _groupKey(row) {
+    const task = row.task;
+    // The sort also orders the sections when it's about the same thing.
+    const flip = (sortKey) => (this._sortBy === sortKey && this._sortReverse ? -1 : 1);
+
     if (this._groupBy === "list") {
-      return { id: row.entryId, label: this._listName(row.entryId) };
+      return { id: row.entryId, label: this._listName(row.entryId), order: [0] };
     }
     if (this._groupBy === "room") {
-      const areaId = row.task.area_id;
-      if (!areaId) return { id: "__no_room__", label: "No room" };
-      return { id: areaId, label: this._areaName(areaId) || "Unknown room" };
+      const areaId = task.area_id;
+      const nestByFloor = this._sortBy === "floor";
+      const floor = this._floorOf(task);
+      const floorKey = floor
+        ? { id: floor.floor_id, label: floor.name, icon: floor.icon }
+        : { id: "__no_floor__", label: "No floor" };
+      if (!areaId) {
+        return { id: "__no_room__", label: "No room", order: [2, 0, 0], floor: nestByFloor ? floorKey : null };
+      }
+      const label = this._areaName(areaId) || "Unknown room";
+      if (!nestByFloor) return { id: areaId, label, order: [0, this._areaIndex(areaId)] };
+      return {
+        id: areaId,
+        label,
+        order: [floor ? 0 : 1, floor ? flip("floor") * this._floorIndex(floor.floor_id) : 0, this._areaIndex(areaId)],
+        floor: floorKey,
+      };
     }
-    return { id: "__all__", label: "All tasks" };
+    if (this._groupBy === "floor") {
+      const floor = this._floorOf(task);
+      if (!floor) {
+        return task.area_id
+          ? { id: "__no_floor__", label: "No floor", order: [1, 0] }
+          : { id: "__no_room__", label: "No room", order: [1, 1] };
+      }
+      return { id: floor.floor_id, label: floor.name, order: [0, flip("floor") * this._floorIndex(floor.floor_id)] };
+    }
+    if (this._groupBy === "priority") {
+      if (!task.priority) return { id: "__none__", label: "No priority", order: [1, 0] };
+      return {
+        id: task.priority,
+        label: `${PRIORITY_META[task.priority].label} priority`,
+        order: [0, flip("priority") * PRIORITY_SORT_ORDER[task.priority]],
+      };
+    }
+    if (this._groupBy === "effort") {
+      if (!task.effort) return { id: "__none__", label: "No effort set", order: [1, 0] };
+      return {
+        id: task.effort,
+        label: EFFORT_META[task.effort].label,
+        order: [0, flip("effort") * EFFORT_SORT_ORDER[task.effort]],
+      };
+    }
+    return { id: "__all__", label: "All tasks", order: [0] };
   }
 
   _groupRows(rows) {
     const groups = new Map();
     for (const row of rows) {
       const key = this._groupKey(row);
-      if (!groups.has(key.id)) groups.set(key.id, { label: key.label, rows: [] });
+      if (!groups.has(key.id)) groups.set(key.id, { ...key, rows: [] });
       groups.get(key.id).rows.push(row);
     }
-    return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
+    return [...groups.values()].sort((a, b) => compareValues(a.order, b.order) || a.label.localeCompare(b.label));
   }
 
   _renderGroups() {
@@ -463,34 +922,49 @@ class BetterTodoListCard extends HTMLElement {
 
     const rows = this._flattenVisibleTasks();
     if (!rows.length) {
-      this._groupsRoot.innerHTML = `<div class="empty-state">No tasks to show.</div>`;
+      const filtered = this._activeFilterCount() || (this._searchText || "").trim();
+      this._groupsRoot.innerHTML = `<div class="empty-state">${filtered ? "No tasks match these filters." : "No tasks to show."}</div>`;
       return;
     }
 
-    const groups = this._groupRows(rows);
-    this._groupsRoot.innerHTML = groups
-      .map(
-        (g) => `
-        <div class="group">
+    let currentFloor = null;
+    this._groupsRoot.innerHTML = this._groupRows(rows)
+      .map((g) => {
+        let floorHeader = "";
+        if (g.floor && g.floor.id !== currentFloor) {
+          currentFloor = g.floor.id;
+          floorHeader = `<div class="floor-header">${g.floor.icon ? `<ha-icon icon="${escapeHtml(g.floor.icon)}"></ha-icon>` : ""}${escapeHtml(g.floor.label)}</div>`;
+        }
+        return `${floorHeader}
+        <div class="group ${g.floor ? "nested" : ""}">
           <div class="group-header">${escapeHtml(g.label)} <span class="count">${g.rows.length}</span></div>
           <div class="task-list">
             ${g.rows.map((r) => this._taskRowHtml(r.entryId, r.task)).join("")}
           </div>
-        </div>`
-      )
+        </div>`;
+      })
       .join("");
   }
 
   _taskRowHtml(entryId, task) {
     const overdue = isOverdue(task);
+    const waiting = isWaiting(task);
     const subLabel = subtaskProgressLabel(task);
     const dueLabel = formatDue(task.due_date, task.due_time);
     const tagsHtml = (task.tags || []).map((t) => `<span class="chip">${escapeHtml(t)}</span>`).join("");
     const prio = task.priority ? PRIORITY_META[task.priority] : null;
+    const effort = task.effort ? EFFORT_META[task.effort] : null;
     const notes = (task.notes || "").trim();
+    const roomName = task.area_id && this._groupBy !== "room" ? this._areaName(task.area_id) : null;
+    const peopleHtml = (task.assignees || [])
+      .map((p) => `<span class="chip"><ha-icon icon="mdi:account"></ha-icon>${escapeHtml(this._personName(p))}</span>`)
+      .join("");
+    const waitingLabel = waiting
+      ? `<span class="chip"><ha-icon icon="mdi:calendar-clock"></ha-icon>${task.cycle_start ? "Reappears" : "Starts"} ${escapeHtml(formatDateShort(task.next_cycle_start))}</span>`
+      : "";
 
     return `
-      <div class="task-row ${task.status === "completed" ? "completed" : ""}">
+      <div class="task-row ${task.status === "completed" ? "completed" : ""} ${waiting ? "waiting" : ""}">
         <div class="task-row-main">
           <input type="checkbox" class="task-check" data-role="toggle-task" data-task-id="${task.id}" data-entry-id="${entryId}" ${task.status === "completed" ? "checked" : ""}>
           <div class="task-main" data-action="open" data-task-id="${task.id}" data-entry-id="${entryId}">
@@ -498,10 +972,15 @@ class BetterTodoListCard extends HTMLElement {
               ${prio ? `<span class="prio-dot" style="background:${prio.color}" title="${prio.label} priority"></span>` : ""}
               <span class="task-title">${escapeHtml(task.title)}</span>
               ${task.recurrence ? `<ha-icon icon="mdi:repeat" class="recur-icon" title="Repeats"></ha-icon>` : ""}
+              ${task.reminder !== null && task.reminder !== undefined && (task.assignees || []).length ? `<ha-icon icon="mdi:bell-outline" class="recur-icon" title="Reminder on"></ha-icon>` : ""}
             </div>
             <div class="task-meta">
+              ${waitingLabel}
               ${dueLabel ? `<span class="due ${overdue ? "overdue" : ""}">${escapeHtml(dueLabel)}</span>` : ""}
               ${subLabel ? `<span class="subprogress">${subLabel}</span>` : ""}
+              ${effort ? `<span class="chip"><ha-icon icon="${effort.icon}"></ha-icon>${effort.label}</span>` : ""}
+              ${roomName ? `<span class="chip"><ha-icon icon="mdi:door"></ha-icon>${escapeHtml(roomName)}</span>` : ""}
+              ${peopleHtml}
               ${tagsHtml}
             </div>
             ${notes ? `<div class="task-notes" title="${escapeHtml(notes)}">${escapeHtml(notes)}</div>` : ""}
@@ -539,6 +1018,28 @@ class BetterTodoListCard extends HTMLElement {
     return `<div class="subtasks-inline">${rows}</div>`;
   }
 
+  // --- Notices -------------------------------------------------------------------
+
+  _showNotice(text) {
+    clearTimeout(this._noticeTimer);
+    this._noticeRoot.innerHTML = `<div class="notice" role="status">${escapeHtml(text)}</div>`;
+    this._noticeTimer = setTimeout(() => {
+      this._noticeRoot.innerHTML = "";
+    }, NOTICE_DURATION_MS);
+  }
+
+  // After saving or completing: say where a task went if it just disappeared
+  // from view because it's now waiting for its next cycle.
+  _noticeIfHidden(task) {
+    if (!task || this._showCompleted || !isWaiting(task)) return;
+    const when = formatDateShort(task.next_cycle_start);
+    this._showNotice(
+      task.cycle_start
+        ? `"${task.title}" is done for this cycle - it will reappear on ${when}.`
+        : `"${task.title}" will first appear on ${when}. Turn on "Show completed" to see it before then.`
+    );
+  }
+
   // --- Delegated event handlers ------------------------------------------------
 
   async _onClick(e) {
@@ -556,6 +1057,26 @@ class BetterTodoListCard extends HTMLElement {
             return;
           }
           this._openDialog({ mode: "create" });
+          break;
+        case "sort-reverse":
+          this._sortReverse = !this._sortReverse;
+          this._onViewChanged();
+          break;
+        case "toggle-filters":
+          this._filterPanelOpen = !this._filterPanelOpen;
+          this._renderToolbar();
+          this._renderFilterPanel();
+          break;
+        case "filter-chip": {
+          const set = this._filters[el.dataset.key];
+          if (set.has(el.dataset.value)) set.delete(el.dataset.value);
+          else set.add(el.dataset.value);
+          this._onViewChanged();
+          break;
+        }
+        case "clear-filters":
+          this._filters = this._emptyFilters();
+          this._onViewChanged();
           break;
         case "open":
           this._openDialog({ mode: "edit", entryId: el.dataset.entryId, taskId: el.dataset.taskId });
@@ -582,6 +1103,12 @@ class BetterTodoListCard extends HTMLElement {
         case "delete-subtask":
           await this._deleteSubtaskFromDialog(el.dataset.subId);
           break;
+        case "use-earlier-start": {
+          const begin = this._dialogRoot.querySelector("[name=recurrence_start_date]");
+          if (begin) begin.value = el.dataset.date;
+          this._refreshRecurrencePreview();
+          break;
+        }
         default:
           break;
       }
@@ -595,12 +1122,17 @@ class BetterTodoListCard extends HTMLElement {
 
     if (target.id === "show-completed") {
       this._showCompleted = target.checked;
-      this._renderGroups();
+      this._onViewChanged();
       return;
     }
     if (target.id === "group-by") {
       this._groupBy = target.value;
-      this._renderGroups();
+      this._onViewChanged();
+      return;
+    }
+    if (target.id === "sort-by") {
+      this._sortBy = target.value;
+      this._onViewChanged();
       return;
     }
     if (target.dataset && target.dataset.role === "toggle-task") {
@@ -608,8 +1140,9 @@ class BetterTodoListCard extends HTMLElement {
       const wasChecked = target.checked;
       try {
         const command = wasChecked ? "better_todo_list/complete_task" : "better_todo_list/reopen_task";
-        await this._callWS({ type: command, entry_id: entryId, task_id: taskId });
+        const { task } = await this._callWS({ type: command, entry_id: entryId, task_id: taskId });
         await this._refreshTasks();
+        if (wasChecked) this._noticeIfHidden(task);
       } catch (err) {
         target.checked = !wasChecked;
         this._showToastError(err);
@@ -658,18 +1191,43 @@ class BetterTodoListCard extends HTMLElement {
     if (target.id === "repeat-toggle") {
       const fieldsEl = this._dialogRoot.querySelector("#recurrence-fields");
       if (fieldsEl) fieldsEl.style.display = target.checked ? "" : "none";
+      this._refreshRecurrencePreview();
       return;
     }
     if (target.id === "recurrence-type") {
       this._refreshRecurrenceTypeFields();
+      this._refreshRecurrencePreview();
+      return;
+    }
+    if (target.name === "interval_unit") {
+      this._refreshRecurrenceTypeFields({
+        interval_unit: target.value,
+        interval_value: this._dialogRoot.querySelector("[name=interval_value]").value,
+      });
+      this._refreshRecurrencePreview();
       return;
     }
     if (target.id === "recurrence-end-type") {
       this._refreshRecurrenceEndFields();
+      this._refreshRecurrencePreview();
+      return;
+    }
+    if (target.id === "due-rule") {
+      this._refreshDueRuleFields();
+      this._refreshRecurrencePreview();
+      return;
+    }
+    if (target.closest && target.closest("#recurrence-fields")) {
+      this._refreshRecurrencePreview();
     }
   }
 
   _onInput(e) {
+    if (e.target.closest && e.target.closest("#recurrence-fields")) {
+      clearTimeout(this._previewDebounceTimer);
+      this._previewDebounceTimer = setTimeout(() => this._refreshRecurrencePreview(), 300);
+      return;
+    }
     if (e.target.id !== "search") return;
     const value = e.target.value;
     clearTimeout(this._searchDebounceTimer);
@@ -693,40 +1251,37 @@ class BetterTodoListCard extends HTMLElement {
       return;
     }
 
+    const fields = {
+      title: payload.title,
+      notes: payload.notes,
+      due_date: payload.due_date,
+      due_time: payload.due_time,
+      priority: payload.priority,
+      effort: payload.effort,
+      tags: payload.tags,
+      area_id: payload.area_id,
+      assignees: payload.assignees,
+      reminder: payload.reminder,
+      recurrence: payload.recurrence,
+    };
     try {
+      let saved;
       if (this._dialogState.mode === "create") {
-        const { task } = await this._callWS({
-          type: "better_todo_list/create_task",
-          entry_id: payload.entry_id,
-          title: payload.title,
-          notes: payload.notes,
-          due_date: payload.due_date,
-          due_time: payload.due_time,
-          priority: payload.priority,
-          tags: payload.tags,
-          area_id: payload.area_id,
-          recurrence: payload.recurrence,
-        });
+        ({ task: saved } = await this._callWS({ type: "better_todo_list/create_task", entry_id: payload.entry_id, ...fields }));
         for (const title of payload.newSubtasks) {
-          await this._callWS({ type: "better_todo_list/add_sub_task", entry_id: payload.entry_id, task_id: task.id, title });
+          await this._callWS({ type: "better_todo_list/add_sub_task", entry_id: payload.entry_id, task_id: saved.id, title });
         }
       } else {
-        await this._callWS({
+        ({ task: saved } = await this._callWS({
           type: "better_todo_list/update_task",
           entry_id: this._dialogState.entryId,
           task_id: this._dialogState.taskId,
-          title: payload.title,
-          notes: payload.notes,
-          due_date: payload.due_date,
-          due_time: payload.due_time,
-          priority: payload.priority,
-          tags: payload.tags,
-          area_id: payload.area_id,
-          recurrence: payload.recurrence,
-        });
+          ...fields,
+        }));
       }
       this._closeDialog();
       await this._refreshTasks();
+      this._noticeIfHidden(saved);
     } catch (err) {
       this._showDialogError(err);
     }
@@ -760,6 +1315,7 @@ class BetterTodoListCard extends HTMLElement {
     }
 
     dialogEl.showModal();
+    this._refreshRecurrencePreview();
   }
 
   _closeDialog() {
@@ -767,6 +1323,7 @@ class BetterTodoListCard extends HTMLElement {
     if (dialogEl && dialogEl.open) dialogEl.close();
     this._dialogRoot.innerHTML = "";
     this._dialogState = null;
+    clearTimeout(this._previewDebounceTimer);
   }
 
   async _onHistoryToggle() {
@@ -784,8 +1341,10 @@ class BetterTodoListCard extends HTMLElement {
 
   _historyEntriesHtml(history) {
     if (!history || !history.length) return `<div class="hint">No history yet.</div>`;
+    const names = (value) => (Array.isArray(value) ? value.map((p) => this._personName(p)) : value);
     return [...history]
       .reverse()
+      .map((h) => (h.field === "assignees" && h.action === "updated" ? { ...h, old: names(h.old), new: names(h.new) } : h))
       .map(
         (h) => `
         <div class="history-entry">
@@ -811,9 +1370,16 @@ class BetterTodoListCard extends HTMLElement {
         </label>`
       : `<input type="hidden" name="entry_id" value="${escapeHtml(state.entryId || "")}">`;
 
-    const areaOptions = this._areas
+    const areaOptions = [...this._areas]
+      .sort((a, b) => a.name.localeCompare(b.name))
       .map((a) => `<option value="${a.area_id}" ${task && task.area_id === a.area_id ? "selected" : ""}>${escapeHtml(a.name)}</option>`)
       .join("");
+    const levelOptions = (current) =>
+      ["low", "medium", "high"]
+        .map((v) => `<option value="${v}" ${current === v ? "selected" : ""}>${v[0].toUpperCase()}${v.slice(1)}</option>`)
+        .join("");
+    const reminderValue = task && task.reminder !== null && task.reminder !== undefined ? String(task.reminder) : "";
+    const isCycleTask = task && usesCycles(task.recurrence);
 
     return `
       <dialog id="task-dialog">
@@ -831,7 +1397,7 @@ class BetterTodoListCard extends HTMLElement {
           </label>
 
           <div class="field-row">
-            <label>Due date <input type="date" name="due_date" value="${task && task.due_date ? task.due_date : ""}"></label>
+            <label>Due date${isCycleTask ? ` <span class="hint">(this cycle)</span>` : ""} <input type="date" name="due_date" value="${task && task.due_date ? task.due_date : ""}"></label>
             <label>Due time <input type="time" name="due_time" value="${task && task.due_time ? task.due_time : ""}"></label>
           </div>
 
@@ -839,18 +1405,32 @@ class BetterTodoListCard extends HTMLElement {
             <label>Priority
               <select name="priority">
                 <option value="">None</option>
-                <option value="low" ${task && task.priority === "low" ? "selected" : ""}>Low</option>
-                <option value="medium" ${task && task.priority === "medium" ? "selected" : ""}>Medium</option>
-                <option value="high" ${task && task.priority === "high" ? "selected" : ""}>High</option>
+                ${levelOptions(task && task.priority)}
               </select>
             </label>
+            <label>Effort
+              <select name="effort">
+                <option value="">None</option>
+                ${levelOptions(task && task.effort)}
+              </select>
+            </label>
+          </div>
+
+          <div class="field-row">
             <label>Room
               <select name="area_id">
                 <option value="">No room</option>
                 ${areaOptions}
               </select>
             </label>
+            <label>Reminder
+              <select name="reminder">
+                ${REMINDER_OPTIONS.map(([v, label]) => `<option value="${v}" ${reminderValue === v ? "selected" : ""}>${label}</option>`).join("")}
+              </select>
+            </label>
           </div>
+
+          ${this._assigneesFieldHtml(task)}
 
           <label>Tags <span class="hint">(comma-separated)</span>
             <input type="text" name="tags" value="${escapeHtml(task && task.tags ? task.tags.join(", ") : "")}">
@@ -882,6 +1462,32 @@ class BetterTodoListCard extends HTMLElement {
         </form>
       </dialog>
     `;
+  }
+
+  _assigneesFieldHtml(task) {
+    const assigned = new Set((task && task.assignees) || []);
+    // Keep anyone already assigned visible even if they've since been removed as a person.
+    const people = [...this._people];
+    for (const id of assigned) {
+      if (!people.some((p) => p.entity_id === id)) people.push({ entity_id: id, name: this._personName(id), can_notify: false });
+    }
+    if (!people.length) {
+      return `<div class="hint">Add people under Settings &rarr; People to assign tasks and send them reminders.</div>`;
+    }
+    const chips = people
+      .map(
+        (p) => `
+        <label class="pick-chip" title="${p.can_notify ? "" : "No Home Assistant app found for this person - they won't get push reminders"}">
+          <input type="checkbox" name="assignees" value="${escapeHtml(p.entity_id)}" ${assigned.has(p.entity_id) ? "checked" : ""}>
+          ${escapeHtml(p.name)}${p.can_notify ? "" : ` <span class="hint">(no app)</span>`}
+        </label>`
+      )
+      .join("");
+    return `
+      <div>
+        <div class="section-label">Assigned to <span class="hint">- they get this task's reminders on their phone</span></div>
+        <div class="chip-picker">${chips}</div>
+      </div>`;
   }
 
   _newSubtasksFieldHtml() {
@@ -934,6 +1540,7 @@ class BetterTodoListCard extends HTMLElement {
     const type = r.type || "interval";
     const startDate = r.start_date || (task && task.due_date) || todayIso();
     const endType = r.end_type || "none";
+    const hourly = type === "interval" && r.interval_unit === "hours";
 
     return `
       <label>Repeat type
@@ -943,6 +1550,14 @@ class BetterTodoListCard extends HTMLElement {
       </label>
       <div id="recurrence-type-fields">${this._recurrenceTypeFieldsHtml(type, r)}</div>
       <label>Begin <input type="date" name="recurrence_start_date" value="${startDate}"></label>
+      <div id="due-rule-block" style="${hourly ? "display:none" : ""}">
+        <label>Due
+          <select id="due-rule" name="due_rule">
+            ${DUE_RULE_OPTIONS.map(([v, label]) => `<option value="${v}" ${(r.due_rule || "same_day") === v ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <div id="due-rule-fields">${this._dueRuleFieldsHtml(r.due_rule || "same_day", r)}</div>
+      </div>
       <label>Ends
         <select id="recurrence-end-type" name="recurrence_end_type">
           <option value="none" ${endType === "none" ? "selected" : ""}>Never</option>
@@ -951,7 +1566,24 @@ class BetterTodoListCard extends HTMLElement {
         </select>
       </label>
       <div id="recurrence-end-fields">${this._recurrenceEndFieldsHtml(endType, r)}</div>
+      <div id="recurrence-preview" class="recurrence-preview" aria-live="polite"></div>
     `;
+  }
+
+  _dueRuleFieldsHtml(rule, r) {
+    if (rule === "days_after") {
+      return `<label>Days after it appears <input type="number" min="0" max="366" name="due_days" value="${r.due_days ?? 6}"></label>`;
+    }
+    if (rule === "weekday") {
+      const weekday = r.due_weekday ?? 6;
+      return `
+        <label>Due on
+          <select name="due_weekday">
+            ${WEEKDAY_NAMES.map((label, i) => `<option value="${i}" ${Number(weekday) === i ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>`;
+    }
+    return "";
   }
 
   _recurrenceTypeFieldsHtml(type, r) {
@@ -1036,16 +1668,77 @@ class BetterTodoListCard extends HTMLElement {
     return "";
   }
 
-  _refreshRecurrenceTypeFields() {
+  _refreshRecurrenceTypeFields(values = {}) {
     const form = this._dialogRoot.querySelector("#task-form");
     const type = form.querySelector("#recurrence-type").value;
-    form.querySelector("#recurrence-type-fields").innerHTML = this._recurrenceTypeFieldsHtml(type, {});
+    form.querySelector("#recurrence-type-fields").innerHTML = this._recurrenceTypeFieldsHtml(type, values);
+    // "Every N hours" reschedules on completion instead of using cycles,
+    // so it has no due rule.
+    const hourly = type === "interval" && values.interval_unit === "hours";
+    form.querySelector("#due-rule-block").style.display = hourly ? "none" : "";
   }
 
   _refreshRecurrenceEndFields() {
     const form = this._dialogRoot.querySelector("#task-form");
     const endType = form.querySelector("#recurrence-end-type").value;
     form.querySelector("#recurrence-end-fields").innerHTML = this._recurrenceEndFieldsHtml(endType, {});
+  }
+
+  _refreshDueRuleFields() {
+    const form = this._dialogRoot.querySelector("#task-form");
+    const rule = form.querySelector("#due-rule").value;
+    form.querySelector("#due-rule-fields").innerHTML = this._dueRuleFieldsHtml(rule, {});
+  }
+
+  // Asks the backend what the current repeat + due settings will actually
+  // do (see handle_preview_recurrence in websocket_api.py) and shows it
+  // under the settings, so there are no surprises after saving.
+  async _refreshRecurrencePreview() {
+    const form = this._dialogRoot.querySelector("#task-form");
+    const el = form && form.querySelector("#recurrence-preview");
+    if (!el) return;
+    const token = ++this._previewToken;
+
+    let spec;
+    try {
+      spec = this._recurrenceFromForm(form);
+    } catch (err) {
+      el.innerHTML = `<span class="preview-error">${escapeHtml(err.message || err)}</span>`;
+      return;
+    }
+    if (!spec) {
+      el.innerHTML = "";
+      return;
+    }
+    try {
+      const res = await this._callWS({ type: "better_todo_list/preview_recurrence", recurrence: spec });
+      if (token === this._previewToken) el.innerHTML = this._previewHtml(res);
+    } catch (err) {
+      if (token === this._previewToken) el.innerHTML = `<span class="preview-error">${escapeHtml(err.message || err)}</span>`;
+    }
+  }
+
+  _previewHtml(res) {
+    if (!res.uses_cycles) {
+      return `<span>Each time you complete it, it's rescheduled for the next time right away.</span>`;
+    }
+    if (!res.cycles.length) return `<span>This repeat has already ended - the task won't come back.</span>`;
+    const [first, ...rest] = res.cycles;
+    const span = (c) => `${formatDateShort(c.appears)} &rarr; due ${formatDateShort(c.due)}`;
+    const lines = [
+      first.appears <= res.today
+        ? `<span><strong>This cycle:</strong> appeared ${span(first)}</span>`
+        : `<span><strong>First appears</strong> ${span(first)}</span>`,
+    ];
+    if (rest.length) lines.push(`<span>Then: ${rest.map(span).join(", ")}, ...</span>`);
+    lines.push(`<span>Completed tasks are hidden until their next cycle appears. One that isn't done by then is reset for the new cycle.</span>`);
+    if (res.earlier_start) {
+      lines.push(
+        `<button type="button" class="link-btn" data-action="use-earlier-start" data-date="${res.earlier_start}">` +
+          `Start the current cycle now instead (Begin ${escapeHtml(formatDateShort(res.earlier_start))})</button>`
+      );
+    }
+    return lines.join("");
   }
 
   _recurrenceFromForm(form) {
@@ -1084,6 +1777,17 @@ class BetterTodoListCard extends HTMLElement {
       if (recurrence.interval_unit === "hours") {
         const startTimeField = form.querySelector("[name=recurrence_start_time]");
         recurrence.start_time = startTimeField && startTimeField.value ? startTimeField.value : null;
+      }
+    }
+
+    if (usesCycles(recurrence)) {
+      recurrence.due_rule = form.querySelector("[name=due_rule]").value;
+      if (recurrence.due_rule === "days_after") {
+        const days = form.querySelector("[name=due_days]").value;
+        if (days === "" || Number(days) < 0) throw new Error("Enter how many days after it appears it's due.");
+        recurrence.due_days = Number(days);
+      } else if (recurrence.due_rule === "weekday") {
+        recurrence.due_weekday = Number(form.querySelector("[name=due_weekday]").value);
       }
     }
 
@@ -1131,11 +1835,15 @@ class BetterTodoListCard extends HTMLElement {
     const due_date = form.querySelector("[name=due_date]").value || null;
     const due_time = form.querySelector("[name=due_time]").value || null;
     const priority = form.querySelector("[name=priority]").value || null;
+    const effort = form.querySelector("[name=effort]").value || null;
     const tags = (form.querySelector("[name=tags]").value || "")
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
     const area_id = form.querySelector("[name=area_id]").value || null;
+    const assignees = Array.from(form.querySelectorAll("[name=assignees]:checked")).map((el) => el.value);
+    const reminderValue = form.querySelector("[name=reminder]").value;
+    const reminder = reminderValue === "" ? null : Number(reminderValue);
 
     const entryIdField = form.querySelector("[name=entry_id]");
     const entry_id = entryIdField ? entryIdField.value : this._dialogState.entryId;
@@ -1147,7 +1855,7 @@ class BetterTodoListCard extends HTMLElement {
       ? newSubtasksField.value.split("\n").map((s) => s.trim()).filter(Boolean)
       : [];
 
-    return { title, notes, due_date, due_time, priority, tags, area_id, entry_id, recurrence, newSubtasks };
+    return { title, notes, due_date, due_time, priority, effort, tags, area_id, assignees, reminder, entry_id, recurrence, newSubtasks };
   }
 
   // --- Error display -----------------------------------------------------------
@@ -1198,6 +1906,6 @@ if (!customElements.get("better-todo-list-card")) {
     // dashboard's YAML.
     type: "custom:better-todo-list-card",
     name: "Better Todo List",
-    description: "A room-aware todo list with priorities, tags, subtasks, and recurrence.",
+    description: "A room-aware todo list with priorities, effort, tags, subtasks, recurrence, and reminders.",
   });
 }
